@@ -71,11 +71,14 @@ apply_env_bootstrap.TRITON_FULL_AUTOTUNE = False
 #   node / smaller batch).
 #
 # WHAT IT DOES *NOT* CONTROL (separate, independent knobs):
-#   - Streaming data order / shuffle permutation -> $STREAMING_SHUFFLE_SEED
+#   - Streaming in-window sample order / shuffle permutation -> $STREAMING_SHUFFLE_SEED
 #     (get_dataset.streaming_shuffle_seed, below).
 #   - Train/eval holdout user split               -> $SPLIT_SALT (below).
 #   So holding $STREAMING_SHUFFLE_SEED + $SPLIT_SALT fixed and varying ONLY $SEED
 #   isolates the effect of model initialization (a clean init-seed A/B / sweep).
+#   INTER_WINDOW_SHUFFLE is intentionally different: when enabled, its TS
+#   permutation is controlled by this global $SEED, so model init and inter-TS
+#   order move together under one run seed.
 #
 # PARSE NOTE: seed_everything() runs right before make_model() in train_ranker
 # (after the full gin parse), so this binding resolves in the second parse where
@@ -315,6 +318,9 @@ get_dataset.new_path_prefix = %DATA_PATH
 get_dataset.history_length = @hl/env_int()
 hl/env_int.key     = "HISTORY_LENGTH"
 hl/env_int.default = 4086
+get_dataset.cache_dir = @yc/env_path()
+yc/env_path.key     = "YAMBDA_CACHE_DIR"
+yc/env_path.default = ""
 
 # UIH construction strategy — how a user's prior events become the sequence the
 # model attends over. Override via $HISTORY_STRATEGY. Both strategies scan the
@@ -442,6 +448,27 @@ nts/env_int.default = 299
 streaming_train_eval_loop.start_ts = @sts/env_int()
 sts/env_int.key = "START_TS"
 sts/env_int.default = 0
+# Inter-window TS shuffle. Off by default, preserving the original temporal walk
+# over [START_TS, START_TS + NUM_TRAIN_TS). When $INTER_WINDOW_SHUFFLE=1, START_TS
+# is ignored: the loop draws NUM_TRAIN_TS distinct train windows from the dataset
+# train-TS pool, excluding the fixed eval holdout TS range. The permutation is
+# deterministic from the global $SEED (same seed/config -> same TS order; resume
+# regenerates and slices the same sequence).
+streaming_train_eval_loop.inter_window_shuffle = @iws/env_int()
+iws/env_int.key     = "INTER_WINDOW_SHUFFLE"
+iws/env_int.default = 0
+streaming_train_eval_loop.inter_window_shuffle_seed = @iwseed/env_int()
+iwseed/env_int.key     = "SEED"
+iwseed/env_int.default = 1
+# Internal chain-slicing knobs. Normal one-shot runs leave both unset/0. The
+# prenyx chain submitter sets them so each segment consumes a disjoint slice of
+# the same global SEED-derived TS permutation.
+streaming_train_eval_loop.inter_window_shuffle_offset = @iwso/env_int()
+iwso/env_int.key     = "INTER_WINDOW_SHUFFLE_OFFSET"
+iwso/env_int.default = 0
+streaming_train_eval_loop.inter_window_shuffle_total_ts = @iwst/env_int()
+iwst/env_int.key     = "INTER_WINDOW_SHUFFLE_TOTAL_TS"
+iwst/env_int.default = 0
 # Per-step metric logging cadence. Default 50 (one compute_and_log GPU->CPU
 # sync per 50 batches). The streaming-resume test sets METRIC_LOG_FREQ=1 so
 # every step emits a parseable "Step N metrics" line for trajectory comparison.
@@ -525,6 +552,10 @@ evn/env_int.default = 0
 streaming_train_eval_loop.eval_every_data_pct = @edp/env_float()
 edp/env_float.key     = "EVAL_EVERY_DATA_PCT"
 edp/env_float.default = 0.005
+
+streaming_train_eval_loop.checkpoint_frequency = @scf/env_int()
+scf/env_int.key     = "CKPT_EVERY_N_TS"
+scf/env_int.default = 100
 # Double-buffer windows: prepare the next window (index mask + first-batch
 # prefetch) in a background thread during the current window's compute, hiding
 # the per-window reset. Needs persistent_loader=1. Override via env.

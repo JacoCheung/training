@@ -185,11 +185,13 @@ def setup(
     os.environ["MASTER_PORT"] = str(master_port)
 
     BACKEND = dist.Backend.NCCL
-    # Process-group / NCCL watchdog timeout (seconds). Env-overridable so a
-    # diagnostic run can use a short, finite timeout that trips the NCCL flight
-    # recorder dump (TORCH_NCCL_TRACE_BUFFER_SIZE + TORCH_NCCL_DUMP_ON_TIMEOUT)
-    # on a collective desync instead of hanging for the full default.
-    TIMEOUT = int(os.environ.get("PG_TIMEOUT_S", "1800"))
+    # Process-group / NCCL watchdog timeout (seconds). Prefer the idfix knob
+    # while accepting the older prenyx submitter env for compatibility.
+    TIMEOUT = int(
+        os.environ.get("PG_TIMEOUT_S")
+        or os.environ.get("TORCH_DIST_TIMEOUT_SECONDS")
+        or "1800"
+    )
 
     # set device BEFORE init_process_group so NCCL binds this rank to its
     # own GPU; otherwise every rank's first CUDA context lands on GPU 0,
@@ -1031,7 +1033,8 @@ def make_streaming_dataloader(
     # (round-robin), so all ranks stay on the same time front and consume the
     # window in index order. Fork ctx mirrors the train path (COW-share the
     # mmap'd store instead of pickling it into every worker).
-    mp_ctx = "fork" if num_workers and num_workers > 0 else None
+    use_workers = bool(num_workers and num_workers > 0)
+    mp_ctx = "fork" if use_workers else None
     dataloader = DataLoader(
         dataset=subset,
         batch_size=batch_size,
@@ -1039,7 +1042,7 @@ def make_streaming_dataloader(
         collate_fn=collate_fn,
         drop_last=True,
         num_workers=num_workers,
-        prefetch_factor=prefetch_factor,
+        prefetch_factor=prefetch_factor if use_workers else None,
         sampler=DistributedSampler(subset, shuffle=False, drop_last=True),
         multiprocessing_context=mp_ctx,
     )
@@ -1156,9 +1159,8 @@ class _PrefetchingWindowLoader:
         # prefetch. This is a TRAIN-only loader, so held-out eval users are
         # excluded here. `skip_samples` is non-zero only for the very first
         # window after a mid-window resume; subsequent windows always start at 0.
-        self._samplers[buf].set_window(
-            self._dataset.dataset.train_window_indices(ts), skip_samples=skip_samples
-        )
+        indices = self._dataset.dataset.train_window_indices(ts)
+        self._samplers[buf].set_window(indices, skip_samples=skip_samples)
         self._iters[buf] = iter(self._dls[buf])
 
     def stream(self, ts_list: List[int], first_skip_samples: int = 0):
@@ -1241,7 +1243,8 @@ def make_train_test_dataloaders(
     # 211 GB yambda store materializes the entire dataset into the parent's anon
     # memory (~230 GB/rank). Forcing "fork" lets workers inherit the parent's
     # mmap'd pages via COW with zero extra anon.
-    mp_ctx = "fork" if num_workers and num_workers > 0 else None
+    use_workers = bool(num_workers and num_workers > 0)
+    mp_ctx = "fork" if use_workers else None
     train_dataloader = DataLoader(
         dataset=train_set,
         batch_size=batch_size,
@@ -1249,7 +1252,7 @@ def make_train_test_dataloaders(
         collate_fn=collate_fn,
         drop_last=True,
         num_workers=num_workers,
-        prefetch_factor=prefetch_factor,
+        prefetch_factor=prefetch_factor if use_workers else None,
         sampler=ChunkDistributedSampler(train_set, drop_last=True, shuffle=True),
         multiprocessing_context=mp_ctx,
     )
@@ -1260,7 +1263,7 @@ def make_train_test_dataloaders(
         collate_fn=collate_fn,
         drop_last=True,
         num_workers=num_workers,
-        prefetch_factor=prefetch_factor,
+        prefetch_factor=prefetch_factor if use_workers else None,
         sampler=ChunkDistributedSampler(test_set, drop_last=True, shuffle=True),
         multiprocessing_context=mp_ctx,
     )
@@ -1902,6 +1905,10 @@ def streaming_train_eval_loop(
     mlperf_train_loss_log_frequency: int = 0,
     checkpoint_frequency: int = 100,
     start_ts: int = 0,
+    inter_window_shuffle: int = 0,
+    inter_window_shuffle_seed: int = 1,
+    inter_window_shuffle_offset: int = 0,
+    inter_window_shuffle_total_ts: int = 0,
     persistent_loader: bool = False,
     eval_every_n_windows: int = 1,
     # Data-fraction eval cadence (mutually exclusive with eval_every_n_windows).
@@ -2035,32 +2042,161 @@ def streaming_train_eval_loop(
     # per-window eval. Detect support once.
     supports_holdout = hasattr(dataset.dataset, "eval_holdout_indices")
 
-    # Fixed eval-holdout window range. Captured from the REQUESTED (start_ts,
-    # num_train_ts) BEFORE the resume block mutates them, so it is identical on
-    # cold start and on every resume (the supervisor relaunches with the same
-    # START_TS / NUM_TRAIN_TS). Defaults to the window just past training.
-    requested_end_ts = start_ts + num_train_ts
-    # Eval-cadence anchor: the ORIGINAL requested start_ts, captured BEFORE the
-    # resume block rebases start_ts. `_should_eval` keys the every-N-windows
-    # cadence off the absolute window ts relative to THIS anchor, so the eval
-    # grid (e.g. 150,160,170,...) is identical on cold start and on every resume.
-    # (Keying off the per-call loop index instead would re-anchor the grid to
-    # whatever window a mid-run resume happens to restart from.)
-    eval_anchor_ts = start_ts
-    # None (Python default) or <0 (the env-binding default) both mean "use the
-    # window just past training", which is stable across resume.
-    eval_holdout_ts_resolved = (
-        eval_holdout_ts
-        if (eval_holdout_ts is not None and eval_holdout_ts >= 0)
-        else requested_end_ts
-    )
+    inter_window_shuffle_enabled = bool(inter_window_shuffle)
+    available_windows: Optional[int] = None
+    if hasattr(dataset.dataset, "num_windows"):
+        available_windows = dataset.dataset.num_windows()  # pyre-ignore [16]
+    if inter_window_shuffle_enabled and available_windows is None:
+        raise ValueError(
+            "INTER_WINDOW_SHUFFLE=1 requires a streaming dataset with num_windows()."
+        )
+    if inter_window_shuffle_enabled and not supports_holdout:
+        raise ValueError(
+            "INTER_WINDOW_SHUFFLE=1 requires fixed eval holdout support; "
+            "otherwise the legacy next-window eval would be ill-defined."
+        )
+
+    if inter_window_shuffle_enabled:
+        assert available_windows is not None
+        inter_window_shuffle_offset_resolved = max(0, int(inter_window_shuffle_offset))
+        eval_holdout_ts_resolved = (
+            eval_holdout_ts
+            if (eval_holdout_ts is not None and eval_holdout_ts >= 0)
+            else max(0, available_windows - eval_holdout_num_windows)
+        )
+        eval_holdout_end = min(
+            available_windows,
+            eval_holdout_ts_resolved + max(1, eval_holdout_num_windows),
+        )
+        holdout_windows = set(range(eval_holdout_ts_resolved, eval_holdout_end))
+        train_candidates = [
+            ts for ts in range(available_windows) if ts not in holdout_windows
+        ]
+        requested_total_ts = (
+            int(inter_window_shuffle_total_ts)
+            if inter_window_shuffle_total_ts and inter_window_shuffle_total_ts > 0
+            else inter_window_shuffle_offset_resolved + num_train_ts
+        )
+        if requested_total_ts > len(train_candidates):
+            logger.warning(
+                "INTER_WINDOW_SHUFFLE requested total_ts=%d but only %d "
+                "train candidate windows are available after excluding eval "
+                "holdout ts=[%d, %d); clamping.",
+                requested_total_ts,
+                len(train_candidates),
+                eval_holdout_ts_resolved,
+                eval_holdout_end,
+            )
+            requested_total_ts = len(train_candidates)
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(int(inter_window_shuffle_seed))
+        perm = torch.randperm(len(train_candidates), generator=generator).tolist()
+        global_train_ts_list = [
+            int(train_candidates[j]) for j in perm[:requested_total_ts]
+        ]
+        full_train_ts_list = global_train_ts_list[
+            inter_window_shuffle_offset_resolved : inter_window_shuffle_offset_resolved
+            + num_train_ts
+        ]
+        if len(full_train_ts_list) < num_train_ts:
+            logger.warning(
+                "INTER_WINDOW_SHUFFLE segment requested offset=%d num_train_ts=%d "
+                "but global shuffled train list has only %d windows; segment has %d.",
+                inter_window_shuffle_offset_resolved,
+                num_train_ts,
+                len(global_train_ts_list),
+                len(full_train_ts_list),
+            )
+        # In shuffled mode START_TS is intentionally ignored; the run is specified
+        # by NUM_TRAIN_TS plus the global SEED-derived permutation.
+        eval_anchor_ts = 0
+        requested_end_ts = available_windows
+        if rank == 0:
+            logger.info(
+                "INTER_WINDOW_SHUFFLE enabled: seed=%d num_train_ts=%d "
+                "offset=%d total_ts=%d candidate_windows=%d "
+                "eval_holdout_ts=[%d, %d) first_segment_ts=%s",
+                inter_window_shuffle_seed,
+                len(full_train_ts_list),
+                inter_window_shuffle_offset_resolved,
+                len(global_train_ts_list),
+                len(train_candidates),
+                eval_holdout_ts_resolved,
+                eval_holdout_end,
+                full_train_ts_list[:20],
+            )
+    else:
+        inter_window_shuffle_offset_resolved = 0
+        # Windows are [start_ts, start_ts + num_train_ts); each step trains window T
+        # then evals window T+1, so the last eval window is start_ts + num_train_ts,
+        # which must be < num_windows(). Anchors require >= history_length prior
+        # events, so the earliest windows are near-empty warm-up — use start_ts to
+        # begin at a dense window. Clamp instead of failing.
+        if available_windows is not None:
+            max_count = max(0, available_windows - 1 - start_ts)
+            if num_train_ts > max_count:
+                logger.warning(
+                    f"start_ts={start_ts} + num_train_ts={num_train_ts} exceeds "
+                    f"available windows ({available_windows}); clamping num_train_ts to {max_count}."
+                )
+                num_train_ts = max_count
+        requested_end_ts = start_ts + num_train_ts
+        eval_anchor_ts = start_ts
+        # None (Python default) or <0 (the env-binding default) both mean "use the
+        # window just past training", which is stable across resume.
+        eval_holdout_ts_resolved = (
+            eval_holdout_ts
+            if (eval_holdout_ts is not None and eval_holdout_ts >= 0)
+            else requested_end_ts
+        )
+        full_train_ts_list = list(range(start_ts, start_ts + num_train_ts))
+        global_train_ts_list = full_train_ts_list
+
+    def _compute_total_train_anchors_for_windows(
+        train_windows: List[int],
+    ) -> Optional[int]:
+        if len(train_windows) == 0:
+            return 0
+        if (
+            not inter_window_shuffle_enabled
+            and hasattr(dataset.dataset, "total_train_anchors")
+        ):
+            return dataset.dataset.total_train_anchors(  # pyre-ignore[16]
+                eval_anchor_ts, requested_end_ts - eval_anchor_ts
+            )
+        if hasattr(dataset.dataset, "train_window_indices"):
+            return sum(
+                len(dataset.dataset.train_window_indices(ts))  # pyre-ignore[16]
+                for ts in train_windows
+            )
+        return None
+
+    def _total_train_anchors_for_windows(train_windows: List[int]) -> Optional[int]:
+        # The fast full-range helper still scans the mmap'd uid array and can
+        # take minutes on huge ranges. Do it on rank 0 and broadcast the scalar
+        # so other ranks do not drift into the first collective early.
+        if world_size > 1 and torch.distributed.is_initialized():
+            local_total = (
+                _compute_total_train_anchors_for_windows(train_windows)
+                if rank == 0
+                else None
+            )
+            total_tensor = torch.tensor(
+                [-1 if local_total is None else int(local_total)],
+                dtype=torch.int64,
+                device=device,
+            )
+            torch.distributed.broadcast(total_tensor, src=0)
+            total_value = int(total_tensor.item())
+            return None if total_value < 0 else total_value
+        return _compute_total_train_anchors_for_windows(train_windows)
 
     # Data-fraction eval cadence: convert eval_every_data_pct into a global
-    # train-step interval ONCE, over the ORIGINAL requested window range
-    # [eval_anchor_ts, requested_end_ts). Keying the later trigger off
-    # `global_step % eval_interval_steps` (global_step is monotonic and
-    # checkpoint-restored) makes the eval grid identical on cold start and on
-    # every resume, exactly like checkpoint_step_frequency. 0 => disabled.
+    # train-step interval ONCE, over the ORIGINAL requested train window list.
+    # Keying the later trigger off `global_step % eval_interval_steps`
+    # (global_step is monotonic and checkpoint-restored) makes the eval grid
+    # identical on cold start and on every resume, exactly like
+    # checkpoint_step_frequency. 0 => disabled.
     eval_interval_steps = 0
     if eval_every_data_pct and eval_every_data_pct > 0:
         # Per-rank batch size: the persistent loader carries it directly; the
@@ -2071,31 +2207,8 @@ def streaming_train_eval_loop(
             if persistent_dl is not None
             else int(os.environ.get("BATCH_SIZE", "1024"))
         )
-        if hasattr(dataset.dataset, "total_train_anchors"):
-            # total_train_anchors does a full-range gather over the mmap'd uid
-            # array for ~billions of positions + a uid hash. It is slow
-            # (minutes, single-threaded) AND, run on every rank independently,
-            # a large per-rank skew source: a fast rank finishes and races into
-            # the first embedding all-to-all while slow ranks are still hashing,
-            # desyncing the NCCL collective stream and hanging the job. The
-            # result is a pure function of the (identical) dataset + split, so
-            # compute it ONCE on rank 0 and broadcast the scalar; ranks 1..N
-            # skip the gather entirely (no 8x mmap/CPU contention, no skew).
-            if world_size > 1 and torch.distributed.is_initialized():
-                _tta = (
-                    dataset.dataset.total_train_anchors(  # pyre-ignore[16]
-                        eval_anchor_ts, requested_end_ts - eval_anchor_ts
-                    )
-                    if rank == 0
-                    else 0
-                )
-                _tta_t = torch.tensor([_tta], dtype=torch.int64, device=device)
-                torch.distributed.broadcast(_tta_t, src=0)
-                total_train_anchors = int(_tta_t.item())
-            else:
-                total_train_anchors = dataset.dataset.total_train_anchors(  # pyre-ignore[16]
-                    eval_anchor_ts, requested_end_ts - eval_anchor_ts
-                )
+        total_train_anchors = _total_train_anchors_for_windows(full_train_ts_list)
+        if total_train_anchors is not None:
             total_train_steps = total_train_anchors // max(1, bs * world_size)
             eval_interval_steps = max(
                 1, round(eval_every_data_pct * total_train_steps)
@@ -2104,19 +2217,18 @@ def streaming_train_eval_loop(
                 logger.info(
                     "[data-pct-eval] eval_every_data_pct=%.6g -> "
                     "eval_interval_steps=%d (total_train_anchors=%d bs=%d "
-                    "world_size=%d total_train_steps=%d over windows [%d, %d))",
+                    "world_size=%d total_train_steps=%d train_windows=%d)",
                     eval_every_data_pct,
                     eval_interval_steps,
                     total_train_anchors,
                     bs,
                     world_size,
                     total_train_steps,
-                    eval_anchor_ts,
-                    requested_end_ts,
+                    len(full_train_ts_list),
                 )
         elif rank == 0:
             logger.warning(
-                "[data-pct-eval] dataset %s has no total_train_anchors(); "
+                "[data-pct-eval] dataset %s has no train-window anchor counter; "
                 "data-fraction eval is DISABLED (no per-window eval either, "
                 "since EVAL_EVERY_N_WINDOWS must be 0 to reach here) — only the "
                 "final eval will run.",
@@ -2138,6 +2250,14 @@ def streaming_train_eval_loop(
             "batch_size": persistent_dl.batch_size if persistent_dl is not None else None,
             "world_size": world_size,
         }
+        if inter_window_shuffle_enabled:
+            live_split_contract.update(
+                {
+                    "inter_window_shuffle": True,
+                    "inter_window_shuffle_seed": int(inter_window_shuffle_seed),
+                    "inter_window_train_ts_list": global_train_ts_list,
+                }
+            )
         # Only validate on an actual resume. On a genuine cold start there is no
         # prior split to verify and establishing this run's split is always safe;
         # validating there would wrongly reject every fresh holdout run. A resume
@@ -2146,48 +2266,83 @@ def streaming_train_eval_loop(
         if not resume_cold_start:
             _validate_split_contract(resume_split_contract, live_split_contract, rank)
 
-    # Apply resume hint: advance start_ts past the last completed window, or
-    # re-enter the partial window with a per-rank skip on its first iter.
-    # Shrink num_train_ts by the same amount so the resumed run finishes at
-    # the same final timestamp (start_ts + num_train_ts) as a fresh run would
-    # — i.e. resumed and uninterrupted produce identical total work.
     first_skip_samples = 0
+    train_ts_list = full_train_ts_list
+    train_window_offset = 0
     if resume_train_ts is not None:
-        original_end_ts = start_ts + num_train_ts
-        if resume_batch_idx_in_window == WINDOW_COMPLETE:
-            new_start = resume_train_ts + 1
-            if rank == 0:
-                logger.info(
-                    "Resuming from completed train_ts=%d → start_ts=%d "
-                    "(num_train_ts %d → %d)",
-                    resume_train_ts, new_start,
-                    num_train_ts, max(0, original_end_ts - new_start),
+        try:
+            resume_idx = full_train_ts_list.index(resume_train_ts)
+        except ValueError:
+            resume_global_idx: Optional[int] = None
+            if inter_window_shuffle_enabled:
+                try:
+                    resume_global_idx = global_train_ts_list.index(resume_train_ts)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Cannot resume inter-window shuffled run from train_ts="
+                        f"{resume_train_ts}: it is not in the global shuffled "
+                        "train_ts sequence for this SEED/config."
+                    ) from exc
+            if resume_batch_idx_in_window != WINDOW_COMPLETE:
+                raise ValueError(
+                    f"Cannot resume mid-window train_ts={resume_train_ts}: it is "
+                    "not in this run's train_ts sequence."
                 )
-            start_ts = new_start
-        else:
+            if (
+                inter_window_shuffle_enabled
+                and resume_global_idx is not None
+                and resume_global_idx >= inter_window_shuffle_offset_resolved
+            ):
+                raise ValueError(
+                    f"Checkpoint train_ts={resume_train_ts} is at shuffled "
+                    f"sequence index {resume_global_idx}, which is not before "
+                    f"this segment offset {inter_window_shuffle_offset_resolved}."
+                )
             if rank == 0:
                 logger.info(
-                    "Resuming mid-window at train_ts=%d batch_idx_in_window=%d "
-                    "(skipping batches already trained)",
+                    "Checkpoint train_ts=%d is outside this run's train_ts "
+                    "sequence; starting from the requested first window.",
                     resume_train_ts,
-                    resume_batch_idx_in_window,
                 )
-            start_ts = resume_train_ts
-            # `batch_size` is per-rank from the persistent dataloader (set via
-            # gin `make_persistent_streaming_dataloader.batch_size`). The
-            # skip-samples-per-rank below maps "K batches done" → "K * bs
-            # samples in this rank's index list", since each batch draws bs
-            # samples from this rank's deterministic round-robin slice.
-            assert persistent_dl is not None, (
-                "Mid-window resume requires persistent_loader=True"
-            )
-            first_skip_samples = resume_batch_idx_in_window * persistent_dl.batch_size
-        num_train_ts = max(0, original_end_ts - start_ts)
-        if num_train_ts == 0 and rank == 0:
+        else:
+            if resume_batch_idx_in_window == WINDOW_COMPLETE:
+                train_window_offset = resume_idx + 1
+                train_ts_list = full_train_ts_list[train_window_offset:]
+                if rank == 0:
+                    logger.info(
+                        "Resuming from completed train_ts=%d at sequence index %d "
+                        "-> remaining_windows=%d",
+                        resume_train_ts,
+                        resume_idx,
+                        len(train_ts_list),
+                    )
+            else:
+                train_window_offset = resume_idx
+                train_ts_list = full_train_ts_list[train_window_offset:]
+                if rank == 0:
+                    logger.info(
+                        "Resuming mid-window at train_ts=%d sequence index %d "
+                        "batch_idx_in_window=%d (skipping batches already trained)",
+                        resume_train_ts,
+                        resume_idx,
+                        resume_batch_idx_in_window,
+                    )
+                # `batch_size` is per-rank from the persistent dataloader (set via
+                # gin `make_persistent_streaming_dataloader.batch_size`). The
+                # skip-samples-per-rank below maps "K batches done" → "K * bs
+                # samples in this rank's index list", since each batch draws bs
+                # samples from this rank's deterministic round-robin slice.
+                assert persistent_dl is not None, (
+                    "Mid-window resume requires persistent_loader=True"
+                )
+                first_skip_samples = (
+                    resume_batch_idx_in_window * persistent_dl.batch_size
+                )
+        if len(train_ts_list) == 0 and rank == 0:
             logger.info(
-                "Resume target already reached (end_ts=%d, start_ts=%d) — "
+                "Resume target already reached (requested_windows=%d) — "
                 "no further training windows; skipping straight to final eval.",
-                original_end_ts, start_ts,
+                len(full_train_ts_list),
             )
 
     if rank == 0:
@@ -2556,10 +2711,22 @@ def streaming_train_eval_loop(
         # Return metrics (on every rank) so the MLPerf eval hooks can consume them.
         return _eval_metrics
 
-    def _maybe_checkpoint(train_ts: int) -> None:
-        if (
-            train_ts % checkpoint_frequency == 0 and train_ts > 0
-        ) or train_ts == start_ts + num_train_ts - 1:
+    n_train = len(train_ts_list)
+
+    def _maybe_checkpoint(train_ts: int, local_window_idx: int) -> None:
+        absolute_window_count = train_window_offset + local_window_idx + 1
+        if inter_window_shuffle_enabled:
+            periodic = (
+                checkpoint_frequency > 0
+                and absolute_window_count % checkpoint_frequency == 0
+            )
+        else:
+            periodic = (
+                checkpoint_frequency > 0
+                and train_ts % checkpoint_frequency == 0
+                and train_ts > 0
+            )
+        if periodic or local_window_idx == n_train - 1:
             # End-of-window save: stamp WINDOW_COMPLETE so resume advances past
             # this train_ts. `device` enables per-rank RNG snapshot for
             # bit-equal resume of dropout-bearing modules.
@@ -2576,12 +2743,6 @@ def streaming_train_eval_loop(
             )
             last_ckpt_time[0] = time.time()
 
-    # Apply start_ts shift from resume (may have moved past the original start).
-    # num_train_ts is the requested *count*; preserve it so the loop runs for
-    # the same total number of windows post-resume as a fresh run would have.
-    train_ts_list = list(range(start_ts, start_ts + num_train_ts))
-    n_train = len(train_ts_list)
-
     def _should_eval(i: int) -> bool:
         """Whether to run the full-holdout eval after training window index `i`.
 
@@ -2589,19 +2750,24 @@ def streaming_train_eval_loop(
           * <=0 -> eval disabled entirely (train-only; e.g. perf benchmarking or
             the resume test). The eval dataloader is not even built.
           * 1 (default) -> eval after every window.
-          * K>1 -> eval when the ABSOLUTE window ts is on the grid anchored at
-            `eval_anchor_ts` (the original start_ts), i.e. ts in {anchor,
-            anchor+K, anchor+2K, ...}, and ALWAYS on the final window so the
-            trajectory ends with an eval point. Anchoring to the absolute ts
-            (not the per-call loop index `i`) keeps the eval grid (e.g.
-            150,160,170,...) stable across a mid-run resume, which rebases
-            start_ts/`train_ts_list` to the resume window.
+          * K>1 -> sequential streaming evals on the ABSOLUTE window-ts grid
+            anchored at `eval_anchor_ts`; inter-window shuffle evals on the
+            deterministic train-sequence index grid. Both grids are resume-stable
+            and always include the final trained window.
         """
         if eval_every_n_windows <= 0:
             return False
         if eval_every_n_windows == 1:
             return True
-        return (train_ts_list[i] - eval_anchor_ts) % eval_every_n_windows == 0 or i == n_train - 1
+        if inter_window_shuffle_enabled:
+            return (
+                (train_window_offset + i) % eval_every_n_windows == 0
+                or i == n_train - 1
+            )
+        return (
+            (train_ts_list[i] - eval_anchor_ts) % eval_every_n_windows == 0
+            or i == n_train - 1
+        )
 
     # Fixed eval set: held-out users' anchors over the resolved holdout window
     # range, computed ONCE and reused at every eval step. Same anchors every
@@ -2807,7 +2973,7 @@ def streaming_train_eval_loop(
                 )
                 if next_eval_i is not None:
                     eval_iter = iter(eval_dl)
-            _maybe_checkpoint(train_ts)
+            _maybe_checkpoint(train_ts, i)
             # should_stop: per-window convergence. mlt.run_stopped:
             # data-fraction convergence (RUN_STOP fired mid-window by _do_eval_db).
             if should_stop or mlt.run_stopped:
@@ -2899,7 +3065,7 @@ def streaming_train_eval_loop(
                         iter(make_streaming_dataloader(dataset=dataset, ts=train_ts + 1))
                     )
                 should_stop = mlt.eval_stop(eval_metrics)
-            _maybe_checkpoint(train_ts)
+            _maybe_checkpoint(train_ts, i)
             # should_stop: per-window convergence. mlt.run_stopped:
             # data-fraction convergence (RUN_STOP fired mid-window by _do_eval_nb).
             if should_stop or mlt.run_stopped:

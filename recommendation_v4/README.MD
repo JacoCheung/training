@@ -360,11 +360,16 @@ env overrides:
 |---|---|---|---|
 | `START_TS` | `streaming_train_eval_loop.start_ts` | 150 | first window (early windows are near-empty warm-up) |
 | `NUM_TRAIN_TS` | `streaming_train_eval_loop.num_train_ts` | 149 | number of train windows (clamped to available) |
+| `INTER_WINDOW_SHUFFLE` | `streaming_train_eval_loop.inter_window_shuffle` | 0 | when 1, draw train windows from a reproducible global TS permutation instead of walking forward from `START_TS` |
+| `INTER_WINDOW_SHUFFLE_OFFSET` | `streaming_train_eval_loop.inter_window_shuffle_offset` | 0 | segment offset into the global inter-window order |
+| `INTER_WINDOW_SHUFFLE_TOTAL_TS` | `streaming_train_eval_loop.inter_window_shuffle_total_ts` | 0 | optional total length of the global inter-window order |
 | `PERSISTENT_LOADER` | `streaming_train_eval_loop.persistent_loader` | 1 | reuse one worker pool across windows |
 | `DOUBLE_BUFFER` | `streaming_train_eval_loop.double_buffer` | 1 | prepare the next window in a background thread |
-| `EVAL_EVERY_N_WINDOWS` | `streaming_train_eval_loop.eval_every_n_windows` | 1 | eval cadence by window count (0 to use data-pct) |
-| `EVAL_EVERY_DATA_PCT` | `streaming_train_eval_loop.eval_every_data_pct` | 0.0 | eval cadence by fraction of train data (full ref: 0.005) |
+| `EVAL_EVERY_N_WINDOWS` | `streaming_train_eval_loop.eval_every_n_windows` | 0 | eval cadence by window count (0 to use data-pct) |
+| `EVAL_EVERY_DATA_PCT` | `streaming_train_eval_loop.eval_every_data_pct` | 0.005 | eval cadence by fraction of train data |
+| `CKPT_EVERY_N_TS` | `streaming_train_eval_loop.checkpoint_frequency` | 100 | end-of-window checkpoint cadence |
 | `MIN_HISTORY` | `get_dataset.min_history` | 4086 | anchor-eligibility floor (0 = ~all users incl. cold-start) |
+| — | `streaming_train_eval_loop.num_train_batches` / `num_eval_batches` | unset | cap per-window steps (unset = consume full window) |
 
 ### 11.3 Checkpointing & resume
 

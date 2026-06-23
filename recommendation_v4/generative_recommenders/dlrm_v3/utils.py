@@ -1628,6 +1628,7 @@ def get_dataset(
     history_length: Optional[int] = None,
     min_history: Optional[int] = None,
     history_strategy: str = "interleaved",
+    cache_dir: Optional[str] = None,
     streaming_window_seconds: int = 86400,
     streaming_sort_within_window: bool = False,
     streaming_shuffle_fraction: float = 0.0,
@@ -1649,6 +1650,7 @@ def get_dataset(
         AssertionError: If dataset name is not supported.
     """
     assert name in SUPPORTED_DATASETS, f"dataset {name} not supported"
+    cache_dir = cache_dir or None
     if name == "debug":
         return DLRMv3RandomDataset, {}
     if name == "movielens-1m":
@@ -1755,6 +1757,7 @@ def get_dataset(
                 # all ranks on a node share the same physical pages.
                 "processed_dir": os.path.join(new_path_prefix, "processed_5b"),
                 "metadata_dir": os.path.join(new_path_prefix, "shared_metadata"),
+                "cache_dir": cache_dir,
                 # Per-pool truncation cap; total interleaved UIH ~ 3*L/3 = L.
                 # Override via `get_dataset.history_length = N` in gin.
                 "history_length": history_length if history_length is not None else 4096,

@@ -46,7 +46,7 @@ from generative_recommenders.dlrm_v3.datasets.dataset import (
     Samples,
 )
 from generative_recommenders.dlrm_v3.utils import get_dataset, MetricsLogger, Profiler
-from generative_recommenders.common import HammerKernel
+from generative_recommenders.common import HammerKernel, profile_range
 from generative_recommenders.modules.dlrm_hstu import DlrmHSTU, DlrmHSTUConfig
 from torch import distributed as dist
 from torch.distributed.optim import (
@@ -170,6 +170,31 @@ def decorrelate_runtime_rng(rank: int = 0, enabled: bool = True) -> None:
         f"[rank {rank}] decorrelated runtime RNG: SEED={base} + rank={rank} "
         f"=> {offset_seed} (per-rank dropout masks)"
     )
+
+
+def _wrap_optimizer_profile_ranges(optimizer: Optimizer) -> Optimizer:
+    if getattr(optimizer, "_yambda_nvtx_wrapped", False):
+        return optimizer
+
+    for method_name, range_name in (
+        ("zero_grad", "yambda_hstu/train/zero_grad"),
+        ("step", "yambda_hstu/train/optimizer_step"),
+    ):
+        method = getattr(optimizer, method_name)
+
+        def _profiled_method(
+            *args: Any,
+            __method: Callable[..., Any] = method,
+            __range_name: str = range_name,
+            **kwargs: Any,
+        ) -> Any:
+            with profile_range(__range_name):
+                return __method(*args, **kwargs)
+
+        setattr(optimizer, method_name, _profiled_method)
+
+    setattr(optimizer, "_yambda_nvtx_wrapped", True)
+    return optimizer
 
 
 def setup(
@@ -1448,32 +1473,38 @@ def train_loop(
     for epoch in range(num_epochs):
         dataloader.sampler.set_epoch(epoch)  # pyre-ignore [16]
         for sample in dataloader:
-            if streaming_diag_unique_emb and batch_idx < int(
-                os.environ.get("DIAG_EMB_STEPS", "100")
-            ):
-                _log_unique_embedding_diag(
-                    sample,
-                    rank,
-                    batch_idx,
-                    max_steps=int(os.environ.get("DIAG_EMB_STEPS", "100")),
-                    log_every=metric_log_frequency,
-                )
-            optimizer.zero_grad()
-            sample.to(device)
-            (
-                _,
-                _,
-                aux_losses,
-                mt_target_preds,
-                mt_target_labels,
-                mt_target_weights,
-            ) = model.forward(
-                sample.uih_features_kjt,
-                sample.candidates_features_kjt,
-            )
-            # pyre-ignore
-            sum(aux_losses.values()).backward()
-            optimizer.step()
+            with profile_range("yambda_hstu/train/step"):
+                if streaming_diag_unique_emb and batch_idx < int(
+                    os.environ.get("DIAG_EMB_STEPS", "100")
+                ):
+                    _log_unique_embedding_diag(
+                        sample,
+                        rank,
+                        batch_idx,
+                        max_steps=int(os.environ.get("DIAG_EMB_STEPS", "100")),
+                        log_every=metric_log_frequency,
+                    )
+                with profile_range("yambda_hstu/train/zero_grad"):
+                    optimizer.zero_grad()
+                with profile_range("yambda_hstu/data/to_device"):
+                    sample.to(device)
+                with profile_range("yambda_hstu/train/forward"):
+                    (
+                        _,
+                        _,
+                        aux_losses,
+                        mt_target_preds,
+                        mt_target_labels,
+                        mt_target_weights,
+                    ) = model.forward(
+                        sample.uih_features_kjt,
+                        sample.candidates_features_kjt,
+                    )
+                with profile_range("yambda_hstu/train/backward"):
+                    # pyre-ignore
+                    sum(aux_losses.values()).backward()
+                with profile_range("yambda_hstu/train/optimizer_step"):
+                    optimizer.step()
             metric_logger.update(
                 mode="train",
                 predictions=mt_target_preds,
@@ -1528,18 +1559,21 @@ def eval_loop(
     metric_logger.reset(mode="eval")
     with torch.no_grad():
         for sample in dataloader:
-            sample.to(device)
-            (
-                _,
-                _,
-                _,
-                mt_target_preds,
-                mt_target_labels,
-                mt_target_weights,
-            ) = model.forward(
-                sample.uih_features_kjt,
-                sample.candidates_features_kjt,
-            )
+            with profile_range("yambda_hstu/eval/step"):
+                with profile_range("yambda_hstu/data/to_device"):
+                    sample.to(device)
+                with profile_range("yambda_hstu/eval/forward"):
+                    (
+                        _,
+                        _,
+                        _,
+                        mt_target_preds,
+                        mt_target_labels,
+                        mt_target_weights,
+                    ) = model.forward(
+                        sample.uih_features_kjt,
+                        sample.candidates_features_kjt,
+                    )
             metric_logger.update(
                 mode="eval",
                 predictions=mt_target_preds,
@@ -1585,18 +1619,20 @@ class _PipelineModelWrapper(torch.nn.Module):
         # EmbeddingCollection input a plain getattr on the batch placeholder so
         # TorchRec pipelines its input_dist (instead of skipping it for "input
         # modifications").
-        (
-            _,
-            _,
-            aux_losses,
-            mt_target_preds,
-            mt_target_labels,
-            mt_target_weights,
-        ) = self._model(batch)
-        loss = sum(aux_losses.values())
-        num_candidates = batch.candidates_features_kjt.lengths().view(
-            len(batch.candidates_features_kjt.keys()), -1
-        )[0]
+        with profile_range("yambda_hstu/train/pipeline_model_forward"):
+            (
+                _,
+                _,
+                aux_losses,
+                mt_target_preds,
+                mt_target_labels,
+                mt_target_weights,
+            ) = self._model(batch)
+        with profile_range("yambda_hstu/train/loss"):
+            loss = sum(aux_losses.values())
+            num_candidates = batch.candidates_features_kjt.lengths().view(
+                len(batch.candidates_features_kjt.keys()), -1
+            )[0]
         output = (
             aux_losses,
             mt_target_preds,
@@ -1639,11 +1675,14 @@ def build_train_pipeline(
     if grad_clip_norm and grad_clip_norm > 0:
 
         def _clip_grads(_m: torch.nn.Module, _gi: Any, _go: Any) -> None:
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(), max_norm=grad_clip_norm
-            )
+            with profile_range("yambda_hstu/train/clip_grad"):
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=grad_clip_norm
+                )
 
         model.register_full_backward_hook(_clip_grads)
+
+    optimizer = _wrap_optimizer_profile_ranges(optimizer)
 
     return TrainPipelineSparseDist(
         model=model,
@@ -1696,13 +1735,14 @@ def train_eval_loop(
             model.train()
             if train_pipeline is not None:
                 try:
-                    (
-                        aux_losses,
-                        mt_target_preds,
-                        mt_target_labels,
-                        mt_target_weights,
-                        num_candidates,
-                    ) = train_pipeline.progress(train_data_iterator)
+                    with profile_range("yambda_hstu/train/pipeline_progress"):
+                        (
+                            aux_losses,
+                            mt_target_preds,
+                            mt_target_labels,
+                            mt_target_weights,
+                            num_candidates,
+                        ) = train_pipeline.progress(train_data_iterator)
                 except StopIteration:
                     train_data_iterator = iter(train_dataloader)
                     break
@@ -1712,23 +1752,29 @@ def train_eval_loop(
                 except StopIteration:
                     train_data_iterator = iter(train_dataloader)
                     break
-                optimizer.zero_grad()
-                sample.to(device)
-                (
-                    _,
-                    _,
-                    aux_losses,
-                    mt_target_preds,
-                    mt_target_labels,
-                    mt_target_weights,
-                ) = model.forward(
-                    sample.uih_features_kjt,
-                    sample.candidates_features_kjt,
-                )
-                # pyre-ignore
-                sum(aux_losses.values()).backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+                with profile_range("yambda_hstu/train/zero_grad"):
+                    optimizer.zero_grad()
+                with profile_range("yambda_hstu/data/to_device"):
+                    sample.to(device)
+                with profile_range("yambda_hstu/train/forward"):
+                    (
+                        _,
+                        _,
+                        aux_losses,
+                        mt_target_preds,
+                        mt_target_labels,
+                        mt_target_weights,
+                    ) = model.forward(
+                        sample.uih_features_kjt,
+                        sample.candidates_features_kjt,
+                    )
+                with profile_range("yambda_hstu/train/backward"):
+                    # pyre-ignore
+                    sum(aux_losses.values()).backward()
+                with profile_range("yambda_hstu/train/clip_grad"):
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                with profile_range("yambda_hstu/train/optimizer_step"):
+                    optimizer.step()
                 num_candidates = sample.candidates_features_kjt.lengths().view(
                     len(sample.candidates_features_kjt.keys()), -1
                 )[0]
@@ -1768,24 +1814,26 @@ def train_eval_loop(
                         except StopIteration:
                             eval_data_iterator = iter(eval_dataloader)
                             sample = next(eval_data_iterator)
-                        sample.to(device)
-                        (
-                            _,
-                            _,
-                            _,
-                            mt_target_preds,
-                            mt_target_labels,
-                            mt_target_weights,
-                        ) = (
-                            # In pipeline mode the model takes the batch as one
-                            # arg (see _PipelineModelWrapper / DlrmHSTU.forward).
-                            model.forward(sample)
-                            if use_pipeline
-                            else model.forward(
-                                sample.uih_features_kjt,
-                                sample.candidates_features_kjt,
+                        with profile_range("yambda_hstu/data/to_device"):
+                            sample.to(device)
+                        with profile_range("yambda_hstu/eval/forward"):
+                            (
+                                _,
+                                _,
+                                _,
+                                mt_target_preds,
+                                mt_target_labels,
+                                mt_target_weights,
+                            ) = (
+                                # In pipeline mode the model takes the batch as one
+                                # arg (see _PipelineModelWrapper / DlrmHSTU.forward).
+                                model.forward(sample)
+                                if use_pipeline
+                                else model.forward(
+                                    sample.uih_features_kjt,
+                                    sample.candidates_features_kjt,
+                                )
                             )
-                        )
                         metric_logger.update(
                             mode="eval",
                             predictions=mt_target_preds,
@@ -2081,6 +2129,41 @@ def streaming_train_eval_loop(
         persistent_dl = make_persistent_streaming_dataloader(
             dataset=dataset, sampler=window_sampler
         )
+    nsys_capture_start_step = int(os.environ.get("NSYS_CAPTURE_START_STEP", "0") or 0)
+    nsys_capture_end_step = int(os.environ.get("NSYS_CAPTURE_END_STEP", "0") or 0)
+    nsys_capture_enabled = (
+        nsys_capture_start_step > 0
+        and nsys_capture_end_step >= nsys_capture_start_step
+    )
+    nsys_capture_active = False
+
+    def _barrier_if_needed() -> None:
+        if torch.distributed.is_initialized() and world_size > 1:
+            torch.distributed.barrier()
+
+    def _cuda_profiler_start(step: int) -> None:
+        _barrier_if_needed()
+        torch.cuda.synchronize(device)
+        try:
+            torch.cuda.cudart().cudaProfilerStart()
+            if rank == 0:
+                logger.info("NSYS cudaProfilerStart at train global_step=%d", step)
+        except Exception as exc:
+            if rank == 0:
+                logger.warning("NSYS cudaProfilerStart failed: %s", exc)
+        _barrier_if_needed()
+
+    def _cuda_profiler_stop(step: int) -> None:
+        _barrier_if_needed()
+        torch.cuda.synchronize(device)
+        try:
+            torch.cuda.cudart().cudaProfilerStop()
+            if rank == 0:
+                logger.info("NSYS cudaProfilerStop after train global_step=%d", step)
+        except Exception as exc:
+            if rank == 0:
+                logger.warning("NSYS cudaProfilerStop failed: %s", exc)
+        _barrier_if_needed()
 
     # The fixed user-holdout eval is yambda-specific (needs window_indices +
     # the split API). Other streaming datasets (synthetic) keep the legacy
@@ -2503,6 +2586,7 @@ def streaming_train_eval_loop(
         label: Optional[str] = None,
         do_eval: Optional[Callable[[int, int], None]] = None,
     ) -> None:
+        nonlocal nsys_capture_active
         # `start_batch_idx` is set when we're re-entering a window that was
         # interrupted mid-way (in_window resume); the dataloader iterator was
         # already advanced past those batches via the sampler skip, and we
@@ -2519,41 +2603,57 @@ def streaming_train_eval_loop(
                 break
             if _t_next is not None and first_wait is None:
                 first_wait = time.perf_counter() - _t_next
-            if streaming_diag_unique_emb and train_batch_idx < int(
-                os.environ.get("DIAG_EMB_STEPS", "100")
+            current_train_step = metric_logger.global_step["train"] + 1
+            if (
+                nsys_capture_enabled
+                and not nsys_capture_active
+                and current_train_step == nsys_capture_start_step
             ):
-                _log_unique_embedding_diag(
-                    sample,
-                    rank,
-                    train_batch_idx,
-                    max_steps=int(os.environ.get("DIAG_EMB_STEPS", "100")),
-                    log_every=metric_log_frequency,
-                )
-            optimizer.zero_grad()
-            sample.to(device)
-            (
-                _,
-                _,
-                aux_losses,
-                mt_target_preds,
-                mt_target_labels,
-                mt_target_weights,
-            ) = model.forward(
-                sample.uih_features_kjt,
-                sample.candidates_features_kjt,
-            )
-            # pyre-ignore
-            sum(aux_losses.values()).backward()
-            # Gradient clipping for the streaming path. Clips dense params (the
-            # sparse embedding tables use a fused optimizer and are unaffected,
-            # same as the non-streaming path's clip_grad_norm_). OFF by default
-            # (grad_clip_norm=0.0 via $GRAD_CLIP_NORM) so legacy streaming runs
-            # are byte-for-byte unchanged; set >0 to enable.
-            if grad_clip_norm and grad_clip_norm > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), max_norm=grad_clip_norm
-                )
-            optimizer.step()
+                _cuda_profiler_start(current_train_step)
+                nsys_capture_active = True
+            with profile_range("yambda_hstu/train/streaming_step"):
+                if (
+                    streaming_diag_unique_emb
+                    and train_batch_idx < int(os.environ.get("DIAG_EMB_STEPS", "100"))
+                ):
+                    _log_unique_embedding_diag(
+                        sample,
+                        rank,
+                        train_batch_idx,
+                        max_steps=int(os.environ.get("DIAG_EMB_STEPS", "100")),
+                        log_every=metric_log_frequency,
+                    )
+                with profile_range("yambda_hstu/train/zero_grad"):
+                    optimizer.zero_grad()
+                with profile_range("yambda_hstu/data/to_device"):
+                    sample.to(device)
+                with profile_range("yambda_hstu/train/forward"):
+                    (
+                        _,
+                        _,
+                        aux_losses,
+                        mt_target_preds,
+                        mt_target_labels,
+                        mt_target_weights,
+                    ) = model.forward(
+                        sample.uih_features_kjt,
+                        sample.candidates_features_kjt,
+                    )
+                with profile_range("yambda_hstu/train/backward"):
+                    # pyre-ignore
+                    sum(aux_losses.values()).backward()
+                # Gradient clipping for the streaming path. Clips dense params (the
+                # sparse embedding tables use a fused optimizer and are unaffected,
+                # same as the non-streaming path's clip_grad_norm_). OFF by default
+                # (grad_clip_norm=0.0 via $GRAD_CLIP_NORM) so legacy streaming runs
+                # are byte-for-byte unchanged; set >0 to enable.
+                if grad_clip_norm and grad_clip_norm > 0:
+                    with profile_range("yambda_hstu/train/clip_grad"):
+                        torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), max_norm=grad_clip_norm
+                        )
+                with profile_range("yambda_hstu/train/optimizer_step"):
+                    optimizer.step()
             metric_logger.update(
                 mode="train",
                 predictions=mt_target_preds,
@@ -2576,6 +2676,9 @@ def streaming_train_eval_loop(
                     },
                 )
             train_batch_idx += 1
+            if nsys_capture_active and current_train_step >= nsys_capture_end_step:
+                _cuda_profiler_stop(current_train_step)
+                nsys_capture_active = False
             if output_trace:
                 assert profiler is not None
                 profiler.step()
@@ -2709,18 +2812,21 @@ def streaming_train_eval_loop(
                     break
                 if _t_next is not None and first_wait is None:
                     first_wait = time.perf_counter() - _t_next
-                sample.to(device)
-                (
-                    _,
-                    _,
-                    _,
-                    mt_target_preds,
-                    mt_target_labels,
-                    mt_target_weights,
-                ) = model.forward(
-                    sample.uih_features_kjt,
-                    sample.candidates_features_kjt,
-                )
+                with profile_range("yambda_hstu/eval/streaming_step"):
+                    with profile_range("yambda_hstu/data/to_device"):
+                        sample.to(device)
+                    with profile_range("yambda_hstu/eval/forward"):
+                        (
+                            _,
+                            _,
+                            _,
+                            mt_target_preds,
+                            mt_target_labels,
+                            mt_target_weights,
+                        ) = model.forward(
+                            sample.uih_features_kjt,
+                            sample.candidates_features_kjt,
+                        )
                 metric_logger.update(
                     mode="eval",
                     predictions=mt_target_preds,

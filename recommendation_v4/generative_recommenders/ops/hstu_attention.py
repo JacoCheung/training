@@ -19,7 +19,13 @@
 from typing import Optional
 
 import torch
-from generative_recommenders.common import HammerKernel, switch_to_contiguous_if_needed
+from generative_recommenders.common import (
+    HammerKernel,
+    nvtx_range_end_tensor,
+    nvtx_range_start,
+    profile_range,
+    switch_to_contiguous_if_needed,
+)
 from generative_recommenders.ops.cutedsl_hstu_attention import (
     cutedsl_hstu_enabled,
     cutedsl_hstu_mha,
@@ -159,20 +165,30 @@ def hstu_mha(
     if cutedsl_hstu_enabled():
         if is_fx_tracing():
             raise RuntimeError("CUTEDSL HSTU attention does not support FX tracing")
-        return cutedsl_hstu_mha(
-            max_seq_len=max_seq_len,
-            alpha=alpha,
-            q=q,
-            k=k,
-            v=v,
-            seq_offsets=seq_offsets,
-            causal=causal,
-            dropout_pr=dropout_pr,
-            num_targets=num_targets,
-            attn_scale=attn_scale,
-            max_attn_len=max_attn_len,
-            contextual_seq_len=contextual_seq_len,
-            min_full_attn_seq_len=min_full_attn_seq_len,
+        cutedsl_attention_nvtx = nvtx_range_start(
+            "yambda_hstu/hstu/attention/cutedsl",
+            q,
+        )
+        with profile_range("yambda_hstu/hstu/attention/cutedsl"):
+            output = cutedsl_hstu_mha(
+                max_seq_len=max_seq_len,
+                alpha=alpha,
+                q=q,
+                k=k,
+                v=v,
+                seq_offsets=seq_offsets,
+                causal=causal,
+                dropout_pr=dropout_pr,
+                num_targets=num_targets,
+                attn_scale=attn_scale,
+                max_attn_len=max_attn_len,
+                contextual_seq_len=contextual_seq_len,
+                min_full_attn_seq_len=min_full_attn_seq_len,
+            )
+        return nvtx_range_end_tensor(
+            output,
+            "yambda_hstu/hstu/attention/cutedsl",
+            cutedsl_attention_nvtx,
         )
 
     if kernel in [
@@ -197,18 +213,28 @@ def hstu_mha(
         seq_offsets = seq_offsets.contiguous()
 
     if kernel == HammerKernel.TRITON:
-        return triton_hstu_mha(
-            N=max_seq_len,
-            alpha=alpha,
-            q=q,
-            k=k,
-            v=v,
-            seq_offsets=seq_offsets,
-            num_targets=num_targets,
-            max_attn_len=max_attn_len,
-            contextual_seq_len=contextual_seq_len,
-            sort_by_length=sort_by_length,
-            enable_tma=enable_tma,
+        triton_attention_nvtx = nvtx_range_start(
+            "yambda_hstu/hstu/attention/triton",
+            q,
+        )
+        with profile_range("yambda_hstu/hstu/attention/triton"):
+            output = triton_hstu_mha(
+                N=max_seq_len,
+                alpha=alpha,
+                q=q,
+                k=k,
+                v=v,
+                seq_offsets=seq_offsets,
+                num_targets=num_targets,
+                max_attn_len=max_attn_len,
+                contextual_seq_len=contextual_seq_len,
+                sort_by_length=sort_by_length,
+                enable_tma=enable_tma,
+            )
+        return nvtx_range_end_tensor(
+            output,
+            "yambda_hstu/hstu/attention/triton",
+            triton_attention_nvtx,
         )
     elif kernel == HammerKernel.TLX:
         if tlx_bw_hstu_mha_wrapper is None:
@@ -216,64 +242,68 @@ def hstu_mha(
                 "hammer.v2 is required for the TLX kernel. "
                 "Falling back to TRITON or PYTORCH kernel instead."
             )
-        return tlx_bw_hstu_mha_wrapper(
-            max_seq_len=max_seq_len,
-            alpha=alpha,
-            q=q,
-            k=k,
-            v=v,
-            seq_offsets=seq_offsets,
-            attn_scale=torch.tensor(1.0 / max_seq_len, device=q.device),
-            num_targets=num_targets,
-            max_attn_len=max_attn_len,
-            contextual_seq_len=contextual_seq_len,
-            sort_by_length=sort_by_length,
-        )
+        with profile_range("yambda_hstu/hstu/attention/tlx"):
+            return tlx_bw_hstu_mha_wrapper(
+                max_seq_len=max_seq_len,
+                alpha=alpha,
+                q=q,
+                k=k,
+                v=v,
+                seq_offsets=seq_offsets,
+                attn_scale=torch.tensor(1.0 / max_seq_len, device=q.device),
+                num_targets=num_targets,
+                max_attn_len=max_attn_len,
+                contextual_seq_len=contextual_seq_len,
+                sort_by_length=sort_by_length,
+            )
     elif kernel == HammerKernel.TRITON_CC:
-        return triton_cc_hstu_mha(
-            N=max_seq_len,
-            alpha=alpha,
-            q=q,
-            k=k,
-            v=v,
-            seq_offsets=seq_offsets,
-            num_targets=num_targets,
-            max_attn_len=max_attn_len,
-            contextual_seq_len=contextual_seq_len,
-        )
+        with profile_range("yambda_hstu/hstu/attention/triton_cc"):
+            return triton_cc_hstu_mha(
+                N=max_seq_len,
+                alpha=alpha,
+                q=q,
+                k=k,
+                v=v,
+                seq_offsets=seq_offsets,
+                num_targets=num_targets,
+                max_attn_len=max_attn_len,
+                contextual_seq_len=contextual_seq_len,
+            )
     elif kernel == HammerKernel.TRITON_INFERENCE:
-        return aot_triton_kernel_wrapper_ragged_hstu_mha(
-            N=max_seq_len,
-            alpha=alpha,
-            q=q,
-            k=k,
-            v=v,
-            seq_offsets=seq_offsets,
-            invalid_attn_mask_type="causal",
-            num_targets=num_targets,
-            attn_scale=attn_scale,
-            max_attn_len=max_attn_len,
-            contextual_seq_len=contextual_seq_len,
-            full_attn_size=min_full_attn_seq_len,
-            num_softmax_heads=0,
-        )
+        with profile_range("yambda_hstu/hstu/attention/triton_inference"):
+            return aot_triton_kernel_wrapper_ragged_hstu_mha(
+                N=max_seq_len,
+                alpha=alpha,
+                q=q,
+                k=k,
+                v=v,
+                seq_offsets=seq_offsets,
+                invalid_attn_mask_type="causal",
+                num_targets=num_targets,
+                attn_scale=attn_scale,
+                max_attn_len=max_attn_len,
+                contextual_seq_len=contextual_seq_len,
+                full_attn_size=min_full_attn_seq_len,
+                num_softmax_heads=0,
+            )
     else:
-        return pytorch_hstu_mha(
-            max_seq_len=max_seq_len,
-            alpha=alpha,
-            q=q,
-            k=k,
-            v=v,
-            seq_offsets=seq_offsets,
-            causal=True,
-            dropout_pr=dropout_pr,
-            training=training,
-            num_targets=num_targets,
-            attn_scale=attn_scale,
-            max_attn_len=max_attn_len,
-            contextual_seq_len=contextual_seq_len,
-            min_full_attn_seq_len=min_full_attn_seq_len,
-        )
+        with profile_range("yambda_hstu/hstu/attention/pytorch"):
+            return pytorch_hstu_mha(
+                max_seq_len=max_seq_len,
+                alpha=alpha,
+                q=q,
+                k=k,
+                v=v,
+                seq_offsets=seq_offsets,
+                causal=True,
+                dropout_pr=dropout_pr,
+                training=training,
+                num_targets=num_targets,
+                attn_scale=attn_scale,
+                max_attn_len=max_attn_len,
+                contextual_seq_len=contextual_seq_len,
+                min_full_attn_seq_len=min_full_attn_seq_len,
+            )
 
 
 def delta_hstu_mha(
@@ -317,30 +347,32 @@ def delta_hstu_mha(
         v = switch_to_contiguous_if_needed(v)
 
     if kernel == HammerKernel.TRITON:
-        return triton_cached_hstu_mha(
-            N=max_seq_len,
-            alpha=alpha,
-            delta_q=delta_q,
-            k=k,
-            v=v,
-            seq_offsets=seq_offsets,
-            num_targets=num_targets,
-            max_attn_len=max_attn_len,
-            contextual_seq_len=contextual_seq_len,
-            enable_tma=enable_tma,
-        )
+        with profile_range("yambda_hstu/hstu/cached_attention/triton"):
+            return triton_cached_hstu_mha(
+                N=max_seq_len,
+                alpha=alpha,
+                delta_q=delta_q,
+                k=k,
+                v=v,
+                seq_offsets=seq_offsets,
+                num_targets=num_targets,
+                max_attn_len=max_attn_len,
+                contextual_seq_len=contextual_seq_len,
+                enable_tma=enable_tma,
+            )
     elif kernel == HammerKernel.TRITON_CC:
-        return triton_cc_hstu_mha(
-            N=max_seq_len,
-            alpha=alpha,
-            q=delta_q,
-            k=k,
-            v=v,
-            seq_offsets=seq_offsets,
-            num_targets=num_targets,
-            is_delta_q=True,
-            delta_size=DeltaSize,
-        )
+        with profile_range("yambda_hstu/hstu/cached_attention/triton_cc"):
+            return triton_cc_hstu_mha(
+                N=max_seq_len,
+                alpha=alpha,
+                q=delta_q,
+                k=k,
+                v=v,
+                seq_offsets=seq_offsets,
+                num_targets=num_targets,
+                is_delta_q=True,
+                delta_size=DeltaSize,
+            )
     elif kernel == HammerKernel.TRITON_INFERENCE:
         delta_x_offsets = torch.arange(
             0,
@@ -349,28 +381,30 @@ def delta_hstu_mha(
             device=delta_q.device,
             dtype=seq_offsets.dtype,
         )
-        return aot_triton_kernel_wrapper_cached_hstu_mha(
-            N=max_seq_len,
-            alpha=alpha,
-            delta_q=delta_q,
-            k=k,
-            v=v,
-            delta_x_offsets=delta_x_offsets,
-            seq_offsets=seq_offsets,
-            num_targets=num_targets,
-            attn_scale=None,
-            max_attn_len=max_attn_len,
-            full_attn_size=0,
-        )
+        with profile_range("yambda_hstu/hstu/cached_attention/triton_inference"):
+            return aot_triton_kernel_wrapper_cached_hstu_mha(
+                N=max_seq_len,
+                alpha=alpha,
+                delta_q=delta_q,
+                k=k,
+                v=v,
+                delta_x_offsets=delta_x_offsets,
+                seq_offsets=seq_offsets,
+                num_targets=num_targets,
+                attn_scale=None,
+                max_attn_len=max_attn_len,
+                full_attn_size=0,
+            )
     else:
-        return pytorch_cached_hstu_mha(
-            max_seq_len=max_seq_len,
-            alpha=alpha,
-            delta_q=delta_q,
-            k=k,
-            v=v,
-            seq_offsets=seq_offsets,
-            num_targets=num_targets,
-            max_attn_len=max_attn_len,
-            contextual_seq_len=contextual_seq_len,
-        )
+        with profile_range("yambda_hstu/hstu/cached_attention/pytorch"):
+            return pytorch_cached_hstu_mha(
+                max_seq_len=max_seq_len,
+                alpha=alpha,
+                delta_q=delta_q,
+                k=k,
+                v=v,
+                seq_offsets=seq_offsets,
+                num_targets=num_targets,
+                max_attn_len=max_attn_len,
+                contextual_seq_len=contextual_seq_len,
+            )

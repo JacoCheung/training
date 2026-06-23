@@ -17,16 +17,18 @@
 # pyre-strict
 
 import abc
+import contextlib
 import copy
 import os
 from enum import Enum, unique
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, Iterator, List, Optional, Tuple
 
 import torch
 
 # @manual=//triton:triton
 import triton
 from generative_recommenders.ops.utils import is_sm100_plus, is_sm90_plus
+from torch.autograd.profiler import record_function
 from torch.fx._symbolic_trace import is_fx_tracing
 from torch.utils._python_dispatch import _get_current_dispatch_mode_stack
 
@@ -120,6 +122,133 @@ class HammerKernel(Enum):
     TRITON_CC = "TRITON_CC"
     TRITON_INFERENCE = "TRITON_INFERENCE"
     CUTEDSL = "CUTEDSL"
+
+
+@contextlib.contextmanager
+def profile_range(name: str) -> Iterator[None]:
+    """Emit a PyTorch profiler annotation plus an NVTX range for Nsight Systems."""
+    compiler = getattr(torch, "compiler", None)
+    is_compiling = compiler is not None and compiler.is_compiling()
+    if torch.jit.is_scripting() or is_compiling:
+        yield
+        return
+
+    pushed_nvtx = False
+    with record_function(name):
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.nvtx.range_push(name)
+                pushed_nvtx = True
+            except RuntimeError:
+                pushed_nvtx = False
+        try:
+            yield
+        finally:
+            if pushed_nvtx:
+                try:
+                    torch.cuda.nvtx.range_pop()
+                except RuntimeError:
+                    pass
+
+
+def _autograd_nvtx_enabled() -> bool:
+    compiler = getattr(torch, "compiler", None)
+    is_compiling = compiler is not None and compiler.is_compiling()
+    if torch.jit.is_scripting() or is_compiling or is_fx_tracing():
+        return False
+    if not torch.cuda.is_available():
+        return False
+    return os.environ.get("YAMBDA_AUTOGRAD_NVTX", "1").lower() not in (
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _safe_nvtx_pop() -> None:
+    try:
+        torch.cuda.nvtx.range_pop()
+    except RuntimeError:
+        pass
+
+
+class _NvtxRangePush(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx: Any, input_tensor: torch.Tensor, msg: str) -> torch.Tensor:
+        ctx.msg = msg
+        try:
+            torch.cuda.nvtx.range_push(msg)
+        except RuntimeError:
+            pass
+        return input_tensor
+
+    @staticmethod
+    def backward(ctx: Any, grad_in: Any) -> Tuple[Any, None]:
+        _safe_nvtx_pop()
+        return grad_in, None
+
+
+class _NvtxRangePop(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx: Any, input_tensor: torch.Tensor, msg: str) -> torch.Tensor:
+        ctx.msg = msg
+        _safe_nvtx_pop()
+        return input_tensor
+
+    @staticmethod
+    def backward(ctx: Any, grad_in: Any) -> Tuple[Any, None]:
+        msg = ctx.msg
+        try:
+            torch.cuda.nvtx.range_push(msg)
+        except RuntimeError:
+            pass
+        return grad_in, None
+
+
+class _NvtxBinaryIdentity(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx: Any,
+        input_l: torch.Tensor,
+        input_r: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return input_l, input_r
+
+    @staticmethod
+    def backward(ctx: Any, grad_l: Any, grad_r: Any) -> Tuple[Any, Any]:
+        return grad_l, grad_r
+
+
+def nvtx_range_start(
+    name: str,
+    ref_tensor: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    if not _autograd_nvtx_enabled():
+        return None
+    device = ref_tensor.device if ref_tensor is not None and ref_tensor.is_cuda else None
+    placeholder = torch.empty(1, device=device).requires_grad_()
+    return _NvtxRangePush.apply(placeholder, f"{name} forward")
+
+
+def nvtx_range_end_tensor(
+    tensor: torch.Tensor,
+    name: str,
+    token: Optional[torch.Tensor],
+) -> torch.Tensor:
+    if token is None:
+        return tensor
+    if not tensor.requires_grad:
+        _NvtxRangePop.apply(token, f"{name} backward")
+        return tensor
+    tensor, _ = _NvtxBinaryIdentity.apply(tensor, token)
+    return _NvtxRangePop.apply(tensor, f"{name} backward")
+
+
+def nvtx_range_end_token(name: str, token: Optional[torch.Tensor]) -> None:
+    if token is not None:
+        _NvtxRangePop.apply(token, f"{name} backward")
 
 
 class HammerModule(torch.nn.Module, abc.ABC):

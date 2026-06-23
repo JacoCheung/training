@@ -1746,51 +1746,54 @@ def get_dataset(
     if name == "yambda-5b":
         from generative_recommenders.dlrm_v3.configs import YAMBDA_5B_CROSS_SPECS
 
+        cache_dir = os.environ.get("YAMBDA_CACHE_DIR") or None
+        dataset_kwargs = {
+            # Layout: <new_path_prefix>/processed_5b/{train_sessions.parquet,...}
+            # and <new_path_prefix>/shared_metadata/{artist,album}_item_mapping.parquet.
+            # The dataset auto-builds a MAP_SHARED-mmap'd cache of the
+            # flat columns + LISTEN-anchor positions under
+            # <processed_dir>/hstu_cache_L<history_length>/ on first use;
+            # all ranks on a node share the same physical pages.
+            "processed_dir": os.path.join(new_path_prefix, "processed_5b"),
+            "metadata_dir": os.path.join(new_path_prefix, "shared_metadata"),
+            # Per-pool truncation cap; total interleaved UIH ~ 3*L/3 = L.
+            # Override via `get_dataset.history_length = N` in gin.
+            "history_length": history_length if history_length is not None else 4096,
+            "scan_window": 20000,
+            # Anchor-eligibility floor: a LISTEN event qualifies once the
+            # user has >= min_history prior events. Decoupled from
+            # history_length (gather cap) since jagged attention handles
+            # short UIH. None = legacy (require a full history_length).
+            # Override via `get_dataset.min_history = N` / $MIN_HISTORY.
+            "min_history": min_history,
+            # UIH construction: "interleaved" (per-pool L//3 cap) or
+            # "last_n" (last history_length pooled events, no per-pool
+            # split). Strategy-independent on disk — both reuse the same
+            # hstu_cache_L<history_length>/ and positions file (the gather
+            # runs at sample-construction time), so switching needs no
+            # rebuild. Override via $HISTORY_STRATEGY.
+            "history_strategy": history_strategy,
+            "cross_specs": YAMBDA_5B_CROSS_SPECS,
+            # Temporal-streaming knobs (only used under --mode
+            # streaming-train-eval; ignored by the default train-eval path).
+            "streaming_window_seconds": streaming_window_seconds,
+            "streaming_sort_within_window": streaming_sort_within_window,
+            # In-window shuffle diversity dial in [0,1]: K=round(frac*N) within-
+            # segment shuffle. 0=off/user-major, 1=full. Config-invariant and
+            # deterministic by (seed, ts).
+            "streaming_shuffle_fraction": streaming_shuffle_fraction,
+            "streaming_shuffle_seed": streaming_shuffle_seed,
+            # User-level train:eval holdout for the streaming path. 1.0 =
+            # no holdout (legacy). <1.0 holds out (1 - tsp) of users as a
+            # fixed eval set; those users are never trained.
+            "train_split_percentage": train_split_percentage,
+            "split_salt": split_salt,
+        }
+        if cache_dir is not None:
+            dataset_kwargs["cache_dir"] = cache_dir
         return (
             DLRMv3YambdaDataset,
-            {
-                # Layout: <new_path_prefix>/processed_5b/{train_sessions.parquet,...}
-                # and <new_path_prefix>/shared_metadata/{artist,album}_item_mapping.parquet.
-                # The dataset auto-builds a MAP_SHARED-mmap'd cache of the
-                # flat columns + LISTEN-anchor positions under
-                # <processed_dir>/hstu_cache_L<history_length>/ on first use;
-                # all ranks on a node share the same physical pages.
-                "processed_dir": os.path.join(new_path_prefix, "processed_5b"),
-                "metadata_dir": os.path.join(new_path_prefix, "shared_metadata"),
-                "cache_dir": cache_dir,
-                # Per-pool truncation cap; total interleaved UIH ~ 3*L/3 = L.
-                # Override via `get_dataset.history_length = N` in gin.
-                "history_length": history_length if history_length is not None else 4096,
-                "scan_window": 20000,
-                # Anchor-eligibility floor: a LISTEN event qualifies once the
-                # user has >= min_history prior events. Decoupled from
-                # history_length (gather cap) since jagged attention handles
-                # short UIH. None = legacy (require a full history_length).
-                # Override via `get_dataset.min_history = N` / $MIN_HISTORY.
-                "min_history": min_history,
-                # UIH construction: "interleaved" (per-pool L//3 cap) or
-                # "last_n" (last history_length pooled events, no per-pool
-                # split). Strategy-independent on disk — both reuse the same
-                # hstu_cache_L<history_length>/ and positions file (the gather
-                # runs at sample-construction time), so switching needs no
-                # rebuild. Override via $HISTORY_STRATEGY.
-                "history_strategy": history_strategy,
-                "cross_specs": YAMBDA_5B_CROSS_SPECS,
-                # Temporal-streaming knobs (only used under --mode
-                # streaming-train-eval; ignored by the default train-eval path).
-                "streaming_window_seconds": streaming_window_seconds,
-                "streaming_sort_within_window": streaming_sort_within_window,
-                # In-window shuffle diversity dial in [0,1]: K=round(frac*N) within-
-                # segment shuffle. 0=off/user-major, 1=full. Config-invariant and
-                # deterministic by (seed, ts).
-                "streaming_shuffle_fraction": streaming_shuffle_fraction,
-                "streaming_shuffle_seed": streaming_shuffle_seed,
-                # User-level train:eval holdout for the streaming path. 1.0 =
-                # no holdout (legacy). <1.0 holds out (1 - tsp) of users as a
-                # fixed eval set; those users are never trained.
-                "train_split_percentage": train_split_percentage,
-                "split_salt": split_salt,
-            },
+            dataset_kwargs,
         )
     if name == "sampled-streaming-100b":
         return (

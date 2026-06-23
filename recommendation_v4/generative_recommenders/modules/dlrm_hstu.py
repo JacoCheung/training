@@ -28,6 +28,10 @@ from generative_recommenders.common import (
     HammerKernel,
     HammerModule,
     init_mlp_weights_optional_bias,
+    nvtx_range_end_token,
+    nvtx_range_end_tensor,
+    nvtx_range_start,
+    profile_range,
     set_static_max_seq_lens,
 )
 from generative_recommenders.modules.hstu_transducer import HSTUTransducer
@@ -45,7 +49,6 @@ from generative_recommenders.modules.preprocessors import ContextualPreprocessor
 from generative_recommenders.modules.stu import STU, STULayer, STULayerConfig, STUStack
 from generative_recommenders.ops.jagged_tensors import concat_2D_jagged
 from generative_recommenders.ops.layer_norm import LayerNorm, SwishLayerNorm
-from torch.autograd.profiler import record_function
 from torchrec import KeyedJaggedTensor
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.modules.embedding_modules import EmbeddingCollection
@@ -427,20 +430,21 @@ class DlrmHSTU(HammerModule):
         source_lengths = seq_embeddings[
             self._hstu_configs.uih_post_id_feature_name
         ].lengths
-        source_timestamps = concat_2D_jagged(
-            max_seq_len=max_uih_len + max_candidates,
-            max_len_left=max_uih_len,
-            offsets_left=payload_features["uih_offsets"],
-            values_left=payload_features[
-                self._hstu_configs.uih_action_time_feature_name
-            ].unsqueeze(-1),
-            max_len_right=max_candidates,
-            offsets_right=payload_features["candidate_offsets"],
-            values_right=payload_features[
-                self._hstu_configs.candidates_querytime_feature_name
-            ].unsqueeze(-1),
-            kernel=self.hammer_kernel(),
-        ).squeeze(-1)
+        with profile_range("yambda_hstu/embedding/concat_timestamps"):
+            source_timestamps = concat_2D_jagged(
+                max_seq_len=max_uih_len + max_candidates,
+                max_len_left=max_uih_len,
+                offsets_left=payload_features["uih_offsets"],
+                values_left=payload_features[
+                    self._hstu_configs.uih_action_time_feature_name
+                ].unsqueeze(-1),
+                max_len_right=max_candidates,
+                offsets_right=payload_features["candidate_offsets"],
+                values_right=payload_features[
+                    self._hstu_configs.candidates_querytime_feature_name
+                ].unsqueeze(-1),
+                kernel=self.hammer_kernel(),
+            ).squeeze(-1)
         if total_targets is None:
             total_targets = fx_total_targets(num_candidates)
         if total_uih_len is None:
@@ -451,6 +455,15 @@ class DlrmHSTU(HammerModule):
         dtype = embedding.dtype
         if (not self.is_inference) and self._bf16_training:
             embedding = embedding.to(torch.bfloat16)
+        with profile_range("yambda_hstu/embedding/construct_payload"):
+            seq_payloads = self._construct_payload(
+                payload_features=payload_features,
+                seq_embeddings=seq_embeddings,
+            )
+        transducer_nvtx = nvtx_range_start(
+            "yambda_hstu/hstu/transducer",
+            embedding,
+        )
         if torch.jit.is_scripting():
             # TorchScript does not support ``with torch.autocast(...)``.
             # In script-mode inference the dense path is already in bf16
@@ -464,10 +477,7 @@ class DlrmHSTU(HammerModule):
                 seq_embeddings=embedding,
                 seq_lengths=source_lengths,
                 seq_timestamps=source_timestamps,
-                seq_payloads=self._construct_payload(
-                    payload_features=payload_features,
-                    seq_embeddings=seq_embeddings,
-                ),
+                seq_payloads=seq_payloads,
                 num_targets=num_candidates,
             )
         else:
@@ -476,21 +486,24 @@ class DlrmHSTU(HammerModule):
                 dtype=torch.bfloat16,
                 enabled=(not self.is_inference) and self._bf16_training,
             ):
-                candidates_user_embeddings, _ = self._hstu_transducer(
-                    max_uih_len=max_uih_len,
-                    max_targets=max_candidates,
-                    total_uih_len=total_uih_len,
-                    total_targets=total_targets,
-                    seq_embeddings=embedding,
-                    seq_lengths=source_lengths,
-                    seq_timestamps=source_timestamps,
-                    seq_payloads=self._construct_payload(
-                        payload_features=payload_features,
-                        seq_embeddings=seq_embeddings,
-                    ),
-                    num_targets=num_candidates,
-                )
+                with profile_range("yambda_hstu/hstu/transducer"):
+                    candidates_user_embeddings, _ = self._hstu_transducer(
+                        max_uih_len=max_uih_len,
+                        max_targets=max_candidates,
+                        total_uih_len=total_uih_len,
+                        total_targets=total_targets,
+                        seq_embeddings=embedding,
+                        seq_lengths=source_lengths,
+                        seq_timestamps=source_timestamps,
+                        seq_payloads=seq_payloads,
+                        num_targets=num_candidates,
+                    )
         candidates_user_embeddings = candidates_user_embeddings.to(dtype)
+        candidates_user_embeddings = nvtx_range_end_tensor(
+            candidates_user_embeddings,
+            "yambda_hstu/hstu/transducer",
+            transducer_nvtx,
+        )
 
         return candidates_user_embeddings
 
@@ -498,14 +511,22 @@ class DlrmHSTU(HammerModule):
         self,
         seq_embeddings: Dict[str, SequenceEmbedding],
     ) -> torch.Tensor:  # [L, D]
-        all_embeddings = torch.cat(
-            [
-                seq_embeddings[name].embedding
-                for name in self._hstu_configs.item_embedding_feature_names
-            ],
-            dim=-1,
+        with profile_range("yambda_hstu/item/cat_embeddings"):
+            all_embeddings = torch.cat(
+                [
+                    seq_embeddings[name].embedding
+                    for name in self._hstu_configs.item_embedding_feature_names
+                ],
+                dim=-1,
+            )
+        item_mlp_nvtx = nvtx_range_start("yambda_hstu/item/mlp", all_embeddings)
+        with profile_range("yambda_hstu/item/mlp"):
+            item_embeddings = self._item_embedding_mlp(all_embeddings)
+        item_embeddings = nvtx_range_end_tensor(
+            item_embeddings,
+            "yambda_hstu/item/mlp",
+            item_mlp_nvtx,
         )
-        item_embeddings = self._item_embedding_mlp(all_embeddings)
         return item_embeddings
 
     def preprocess(
@@ -528,72 +549,102 @@ class DlrmHSTU(HammerModule):
         # input_dist into the prefetch stage. Building it here (cat +
         # from_lengths_sync's .sync()) is an "input modification" that makes
         # TorchRec skip pipelining the embedding collection.
-        if merged_sparse_features is None:
-            merged_sparse_features = KeyedJaggedTensor.from_lengths_sync(
-                keys=uih_features.keys() + candidates_features.keys(),
-                values=torch.cat(
-                    [uih_features.values(), candidates_features.values()],
-                    dim=0,
-                ),
-                lengths=torch.cat(
-                    [uih_features.lengths(), candidates_features.lengths()],
-                    dim=0,
-                ),
-            )
-        seq_embeddings_dict = self._embedding_collection(merged_sparse_features)
-        num_candidates = fx_mark_length_features(
-            candidates_features.lengths().view(len(candidates_features.keys()), -1)
-        )[0]
-        max_num_candidates = fx_infer_max_len(num_candidates)
-        uih_seq_lengths = uih_features[
-            self._hstu_configs.uih_post_id_feature_name
-        ].lengths()
-        max_uih_len = fx_infer_max_len(uih_seq_lengths)
+        with profile_range("yambda_hstu/embedding/merge_kjt"):
+            if merged_sparse_features is None:
+                merged_sparse_features = KeyedJaggedTensor.from_lengths_sync(
+                    keys=uih_features.keys() + candidates_features.keys(),
+                    values=torch.cat(
+                        [uih_features.values(), candidates_features.values()],
+                        dim=0,
+                    ),
+                    lengths=torch.cat(
+                        [uih_features.lengths(), candidates_features.lengths()],
+                        dim=0,
+                    ),
+                )
+        torchrec_nvtx = nvtx_range_start(
+            "yambda_hstu/embedding/torchrec_collection",
+            merged_sparse_features.values(),
+        )
+        with profile_range("yambda_hstu/embedding/torchrec_collection"):
+            seq_embeddings_dict = self._embedding_collection(merged_sparse_features)
+        with profile_range("yambda_hstu/embedding/length_features"):
+            num_candidates = fx_mark_length_features(
+                candidates_features.lengths().view(len(candidates_features.keys()), -1)
+            )[0]
+            max_num_candidates = fx_infer_max_len(num_candidates)
+            uih_seq_lengths = uih_features[
+                self._hstu_configs.uih_post_id_feature_name
+            ].lengths()
+            max_uih_len = fx_infer_max_len(uih_seq_lengths)
 
         # prepare payload features
-        payload_features: Dict[str, torch.Tensor] = {}
-        for (
-            uih_feature_name,
-            candidate_feature_name,
-        ) in self._hstu_configs.merge_uih_candidate_feature_mapping:
-            if (
-                candidate_feature_name
-                not in self._hstu_configs.item_embedding_feature_names
-                and uih_feature_name
-                not in self._hstu_configs.user_embedding_feature_names
-            ):
-                values_left = uih_features[uih_feature_name].values()
-                if self._is_inference and (
+        with profile_range("yambda_hstu/embedding/payload_features"):
+            payload_features: Dict[str, torch.Tensor] = {}
+            for (
+                uih_feature_name,
+                candidate_feature_name,
+            ) in self._hstu_configs.merge_uih_candidate_feature_mapping:
+                if (
                     candidate_feature_name
-                    == self._hstu_configs.candidates_weight_feature_name
-                    or candidate_feature_name
-                    == self._hstu_configs.candidates_watchtime_feature_name
+                    not in self._hstu_configs.item_embedding_feature_names
+                    and uih_feature_name
+                    not in self._hstu_configs.user_embedding_feature_names
                 ):
-                    total_candidates = torch.sum(num_candidates).item()
-                    values_right = torch.zeros(
-                        total_candidates,  # pyre-ignore
-                        dtype=torch.int64,
-                        device=values_left.device,
-                    )
-                else:
-                    values_right = candidates_features[candidate_feature_name].values()
-                payload_features[uih_feature_name] = values_left
-                payload_features[candidate_feature_name] = values_right
-        payload_features["uih_offsets"] = torch.ops.fbgemm.asynchronous_complete_cumsum(
-            uih_seq_lengths
-        )
-        payload_features["candidate_offsets"] = (
-            torch.ops.fbgemm.asynchronous_complete_cumsum(num_candidates)
-        )
-
-        seq_embeddings = {
-            k: SequenceEmbedding(
-                lengths=seq_embeddings_dict[k].lengths(),
-                embedding=seq_embeddings_dict[k].values(),
+                    values_left = uih_features[uih_feature_name].values()
+                    if self._is_inference and (
+                        candidate_feature_name
+                        == self._hstu_configs.candidates_weight_feature_name
+                        or candidate_feature_name
+                        == self._hstu_configs.candidates_watchtime_feature_name
+                    ):
+                        total_candidates = torch.sum(num_candidates).item()
+                        values_right = torch.zeros(
+                            total_candidates,  # pyre-ignore
+                            dtype=torch.int64,
+                            device=values_left.device,
+                        )
+                    else:
+                        values_right = candidates_features[
+                            candidate_feature_name
+                        ].values()
+                    payload_features[uih_feature_name] = values_left
+                    payload_features[candidate_feature_name] = values_right
+        with profile_range("yambda_hstu/embedding/fbgemm_offsets"):
+            payload_features[
+                "uih_offsets"
+            ] = torch.ops.fbgemm.asynchronous_complete_cumsum(uih_seq_lengths)
+            payload_features["candidate_offsets"] = (
+                torch.ops.fbgemm.asynchronous_complete_cumsum(num_candidates)
             )
-            for k in self._hstu_configs.user_embedding_feature_names
-            + self._hstu_configs.item_embedding_feature_names
-        }
+
+        with profile_range("yambda_hstu/embedding/unpack_sequence_embeddings"):
+            seq_embeddings = {
+                k: SequenceEmbedding(
+                    lengths=seq_embeddings_dict[k].lengths(),
+                    embedding=seq_embeddings_dict[k].values(),
+                )
+                for k in self._hstu_configs.user_embedding_feature_names
+                + self._hstu_configs.item_embedding_feature_names
+            }
+            embedding_anchor = self._hstu_configs.uih_post_id_feature_name
+            if embedding_anchor not in seq_embeddings and len(seq_embeddings) > 0:
+                embedding_anchor = next(iter(seq_embeddings))
+            if embedding_anchor in seq_embeddings:
+                anchor = seq_embeddings[embedding_anchor]
+                seq_embeddings[embedding_anchor] = SequenceEmbedding(
+                    lengths=anchor.lengths,
+                    embedding=nvtx_range_end_tensor(
+                        anchor.embedding,
+                        "yambda_hstu/embedding/torchrec_collection",
+                        torchrec_nvtx,
+                    ),
+                )
+            else:
+                nvtx_range_end_token(
+                    "yambda_hstu/embedding/torchrec_collection",
+                    torchrec_nvtx,
+                )
 
         return (
             seq_embeddings,
@@ -634,35 +685,38 @@ class DlrmHSTU(HammerModule):
                 )
             )
 
-        # merge uih and candidates embeddings
-        for (
-            uih_feature_name,
-            candidate_feature_name,
-        ) in self._hstu_configs.merge_uih_candidate_feature_mapping:
-            if uih_feature_name in seq_embeddings:
-                seq_embeddings[uih_feature_name] = SequenceEmbedding(
-                    lengths=uih_seq_lengths + num_candidates,
-                    embedding=concat_2D_jagged(
-                        max_seq_len=max_uih_len + max_num_candidates,
-                        max_len_left=max_uih_len,
-                        offsets_left=torch.ops.fbgemm.asynchronous_complete_cumsum(
-                            uih_seq_lengths
+        with profile_range("yambda_hstu/embedding/concat_uih_candidates"):
+            # merge uih and candidates embeddings
+            for (
+                uih_feature_name,
+                candidate_feature_name,
+            ) in self._hstu_configs.merge_uih_candidate_feature_mapping:
+                if uih_feature_name in seq_embeddings:
+                    seq_embeddings[uih_feature_name] = SequenceEmbedding(
+                        lengths=uih_seq_lengths + num_candidates,
+                        embedding=concat_2D_jagged(
+                            max_seq_len=max_uih_len + max_num_candidates,
+                            max_len_left=max_uih_len,
+                            offsets_left=torch.ops.fbgemm.asynchronous_complete_cumsum(
+                                uih_seq_lengths
+                            ),
+                            values_left=seq_embeddings[uih_feature_name].embedding,
+                            max_len_right=max_num_candidates,
+                            offsets_right=torch.ops.fbgemm.asynchronous_complete_cumsum(
+                                num_candidates
+                            ),
+                            values_right=seq_embeddings[
+                                candidate_feature_name
+                            ].embedding,
+                            kernel=self.hammer_kernel(),
                         ),
-                        values_left=seq_embeddings[uih_feature_name].embedding,
-                        max_len_right=max_num_candidates,
-                        offsets_right=torch.ops.fbgemm.asynchronous_complete_cumsum(
-                            num_candidates
-                        ),
-                        values_right=seq_embeddings[candidate_feature_name].embedding,
-                        kernel=self.hammer_kernel(),
-                    ),
-                )
+                    )
 
-        with record_function("## item_forward ##"):
+        with profile_range("yambda_hstu/item/forward"):
             candidates_item_embeddings = self._item_forward(
                 seq_embeddings,
             )
-        with record_function("## user_forward ##"):
+        with profile_range("yambda_hstu/user/forward"):
             candidates_user_embeddings = self._user_forward(
                 max_uih_len=max_uih_len,
                 max_candidates=max_num_candidates,
@@ -672,7 +726,11 @@ class DlrmHSTU(HammerModule):
                 total_uih_len=total_uih_len,
                 total_targets=total_targets,
             )
-        with record_function("## multitask_module ##"):
+        multitask_nvtx = nvtx_range_start(
+            "yambda_hstu/multitask/forward",
+            candidates_user_embeddings,
+        )
+        with profile_range("yambda_hstu/multitask/forward"):
             supervision_labels, supervision_weights = (
                 _get_supervision_labels_and_weights(
                     supervision_bitmasks=payload_features[
@@ -692,6 +750,17 @@ class DlrmHSTU(HammerModule):
                     supervision_weights=supervision_weights,
                 )
             )
+            if mt_losses is not None:
+                mt_losses = nvtx_range_end_tensor(
+                    mt_losses,
+                    "yambda_hstu/multitask/forward",
+                    multitask_nvtx,
+                )
+            else:
+                nvtx_range_end_token(
+                    "yambda_hstu/multitask/forward",
+                    multitask_nvtx,
+                )
 
         aux_losses: Dict[str, torch.Tensor] = {}
         if not self._is_inference and self.training:
@@ -732,7 +801,7 @@ class DlrmHSTU(HammerModule):
             candidates_features = batch.candidates_features_kjt
             merged_sparse_features = batch.merged_sparse_features
 
-        with record_function("## preprocess ##"):
+        with profile_range("yambda_hstu/model/preprocess"):
             (
                 seq_embeddings,
                 payload_features,
@@ -746,7 +815,7 @@ class DlrmHSTU(HammerModule):
                 merged_sparse_features=merged_sparse_features,
             )
 
-        with record_function("## main_forward ##"):
+        with profile_range("yambda_hstu/model/main_forward"):
             return self.main_forward(
                 seq_embeddings=seq_embeddings,
                 payload_features=payload_features,

@@ -1861,11 +1861,17 @@ def _validate_split_contract(
                 "trained. Set ALLOW_SPLIT_MISMATCH=1 to override."
             )
         return
-    mismatches = {
-        k: (saved.get(k), live.get(k))
-        for k in live
-        if saved.get(k) != live.get(k)
-    }
+    mismatches = {}
+    for k in live:
+        saved_value = saved.get(k)
+        live_value = live.get(k)
+        if k == "inter_window_train_ts_list" and isinstance(
+            saved_value, list
+        ) and isinstance(live_value, list):
+            if saved_value == live_value[: len(saved_value)]:
+                continue
+        if saved_value != live_value:
+            mismatches[k] = (saved_value, live_value)
     if mismatches:
         msg = (
             "Split/resume contract mismatch between checkpoint and current run: "
@@ -1882,6 +1888,17 @@ def _validate_split_contract(
             raise RuntimeError(msg + " Set ALLOW_SPLIT_MISMATCH=1 to override.")
     elif rank == 0:
         logger.info("Split/resume contract verified against checkpoint: %s", live)
+
+
+def _load_inter_window_shuffle_order(path: str) -> List[int]:
+    """Load a whitespace/comma separated TS order file with optional comments."""
+    values: List[int] = []
+    with open(path) as f:
+        for line in f:
+            line = line.split("#", 1)[0].replace(",", " ")
+            for token in line.split():
+                values.append(int(token))
+    return values
 
 
 @gin.configurable
@@ -1909,6 +1926,7 @@ def streaming_train_eval_loop(
     inter_window_shuffle_seed: int = 1,
     inter_window_shuffle_offset: int = 0,
     inter_window_shuffle_total_ts: int = 0,
+    inter_window_shuffle_order_path: str = "",
     persistent_loader: bool = False,
     eval_every_n_windows: int = 1,
     # Data-fraction eval cadence (mutually exclusive with eval_every_n_windows).
@@ -2088,12 +2106,41 @@ def streaming_train_eval_loop(
                 eval_holdout_end,
             )
             requested_total_ts = len(train_candidates)
-        generator = torch.Generator(device="cpu")
-        generator.manual_seed(int(inter_window_shuffle_seed))
-        perm = torch.randperm(len(train_candidates), generator=generator).tolist()
-        global_train_ts_list = [
-            int(train_candidates[j]) for j in perm[:requested_total_ts]
-        ]
+        order_path = inter_window_shuffle_order_path.strip()
+        if order_path:
+            global_train_ts_list = _load_inter_window_shuffle_order(order_path)
+            seen: Set[int] = set()
+            invalid: List[int] = []
+            duplicated: List[int] = []
+            candidate_set = set(train_candidates)
+            for ts in global_train_ts_list:
+                if ts in seen:
+                    duplicated.append(ts)
+                seen.add(ts)
+                if ts not in candidate_set:
+                    invalid.append(ts)
+            if invalid or duplicated:
+                raise ValueError(
+                    "Invalid INTER_WINDOW_SHUFFLE_ORDER_PATH="
+                    f"{order_path!r}: invalid_ts={invalid[:10]} "
+                    f"duplicated_ts={duplicated[:10]} "
+                    f"eval_holdout_ts=[{eval_holdout_ts_resolved}, {eval_holdout_end})"
+                )
+            if requested_total_ts > len(global_train_ts_list):
+                raise ValueError(
+                    "INTER_WINDOW_SHUFFLE_ORDER_PATH="
+                    f"{order_path!r} has only {len(global_train_ts_list)} windows, "
+                    f"but offset={inter_window_shuffle_offset_resolved} and "
+                    f"num_train_ts={num_train_ts} require at least {requested_total_ts}."
+                )
+            global_train_ts_list = global_train_ts_list[:requested_total_ts]
+        else:
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(int(inter_window_shuffle_seed))
+            perm = torch.randperm(len(train_candidates), generator=generator).tolist()
+            global_train_ts_list = [
+                int(train_candidates[j]) for j in perm[:requested_total_ts]
+            ]
         full_train_ts_list = global_train_ts_list[
             inter_window_shuffle_offset_resolved : inter_window_shuffle_offset_resolved
             + num_train_ts
@@ -2114,13 +2161,14 @@ def streaming_train_eval_loop(
         if rank == 0:
             logger.info(
                 "INTER_WINDOW_SHUFFLE enabled: seed=%d num_train_ts=%d "
-                "offset=%d total_ts=%d candidate_windows=%d "
+                "offset=%d total_ts=%d candidate_windows=%d order_path=%s "
                 "eval_holdout_ts=[%d, %d) first_segment_ts=%s",
                 inter_window_shuffle_seed,
                 len(full_train_ts_list),
                 inter_window_shuffle_offset_resolved,
                 len(global_train_ts_list),
                 len(train_candidates),
+                order_path or "<generated>",
                 eval_holdout_ts_resolved,
                 eval_holdout_end,
                 full_train_ts_list[:20],

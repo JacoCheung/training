@@ -469,6 +469,13 @@ iwso/env_int.default = 0
 streaming_train_eval_loop.inter_window_shuffle_total_ts = @iwst/env_int()
 iwst/env_int.key     = "INTER_WINDOW_SHUFFLE_TOTAL_TS"
 iwst/env_int.default = 0
+# Optional frozen TS order file. When set with INTER_WINDOW_SHUFFLE=1, the loop
+# reads this global order and slices it by INTER_WINDOW_SHUFFLE_OFFSET/
+# NUM_TRAIN_TS instead of generating randperm again. Useful for chained jobs
+# where segment 0 establishes the TS order contract on disk.
+streaming_train_eval_loop.inter_window_shuffle_order_path = @iwop/env_path()
+iwop/env_path.key     = "INTER_WINDOW_SHUFFLE_ORDER_PATH"
+iwop/env_path.default = ""
 # Per-step metric logging cadence. Default 50 (one compute_and_log GPU->CPU
 # sync per 50 batches). The streaming-resume test sets METRIC_LOG_FREQ=1 so
 # every step emits a parseable "Step N metrics" line for trajectory comparison.

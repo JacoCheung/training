@@ -8,6 +8,8 @@ command -v sbatch >/dev/null 2>&1 || { echo "error: sbatch not found; run on pre
 BASE_START_TS="${BASE_START_TS:-150}"
 TOTAL_TRAIN_TS="${TOTAL_TRAIN_TS:-149}"
 FINAL_EVAL_TS="${FINAL_EVAL_TS:-299}"
+GLOBAL_STEP_BASE_TS="${GLOBAL_STEP_BASE_TS:-0}"
+BASE_GLOBAL_STEP_OFFSET="${BASE_GLOBAL_STEP_OFFSET:-0}"
 PARTITION="${PARTITION:-batch}"
 ACCOUNT="${ACCOUNT:-coreai_mlperf_training}"
 TIME_LIMIT="${TIME_LIMIT:-04:00:00}"
@@ -34,6 +36,15 @@ ALLOW_MULTI_NODE="${ALLOW_MULTI_NODE:-0}"
 NODES="${NODES:-1}"
 HISTORY_LENGTH="${HISTORY_LENGTH:-4086}"
 CHAINS="${CHAINS:-}"
+COUNTS_CSV="${COUNTS_CSV:-}"
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-}"
+AUTO_SEGMENT_TS="${AUTO_SEGMENT_TS:-0}"
+SEGMENT_TIME_BUDGET="${SEGMENT_TIME_BUDGET:-3:50:00}"
+TRAIN_SEC_PER_BATCH="${TRAIN_SEC_PER_BATCH:-0.93}"
+SUCCESSOR_OF="${SUCCESSOR_OF:-}"
+SUCCESSOR_REPEAT="${SUCCESSOR_REPEAT:-}"
+SUCCESSOR_SEGMENT="${SUCCESSOR_SEGMENT:-}"
+DEPEND_ON_PREVIOUS_JOB="${DEPEND_ON_PREVIOUS_JOB:-0}"
 
 maxseq_for() { case "$1" in 2039) echo 2048 ;; 4086) echo 4096 ;; *) return 1 ;; esac; }
 cache_for() { [ "$1" = 4086 ] && echo "/lustre/fsw/coreai_mlperf_training/users/junzhang/yambda_cache/hstu_cache_L4086_2026-06-09" || true; }
@@ -41,6 +52,142 @@ ceil_div() { echo $((($1 + $2 - 1) / $2)); }
 q() { printf '%q' "$1"; }
 exp() { printf 'export %s=%s\n' "$1" "$(q "$2")"; }
 opt_exp() { [ -n "$2" ] && exp "$1" "$2" || printf 'unset %s\n' "$1"; }
+
+parse_time_seconds() {
+  python3 - "$1" <<'PY'
+import sys
+
+value = sys.argv[1].strip()
+if value[-1:].lower() == "s":
+    print(float(value[:-1]))
+elif value[-1:].lower() == "m":
+    print(float(value[:-1]) * 60.0)
+elif value[-1:].lower() == "h":
+    print(float(value[:-1]) * 3600.0)
+else:
+    parts = value.split(":")
+    if len(parts) == 3:
+        h, m, s = parts
+        print(int(h) * 3600 + int(m) * 60 + float(s))
+    elif len(parts) == 2:
+        m, s = parts
+        print(int(m) * 60 + float(s))
+    else:
+        print(float(value))
+PY
+}
+
+global_batch_for() {
+  local nodes="$1" bs="$2"
+  if [ -n "$GLOBAL_BATCH_SIZE" ]; then
+    echo "$GLOBAL_BATCH_SIZE"
+  else
+    echo $((nodes * 8 * bs))
+  fi
+}
+
+resolve_counts_csv() {
+  [ -n "$COUNTS_CSV" ] && return 0
+  local cand
+  for cand in \
+    "$REPO_ROOT/scripts/counts_${HISTORY_LENGTH}.csv" \
+    "$REPO_ROOT/scripts/counts_4k_min_history_${HISTORY_LENGTH}.csv" \
+    "$RUN_BASE/counts_4k_min_history_${HISTORY_LENGTH}.csv" \
+    "$RUN_BASE/counts_4k_min_history_4086.csv" \
+    "/lustre/fsw/coreai_mlperf_training/users/junzhang/yambda_runs/counts_4k_min_history_${HISTORY_LENGTH}.csv" \
+    "/lustre/fsw/coreai_mlperf_training/users/junzhang/yambda_runs/counts_4k_min_history_4086.csv" \
+    "/home/scratch.junzhang_sw/workspace/github/yambda-hstu/public/dataset_model/counts_4k_min_history_${HISTORY_LENGTH}.csv"; do
+    if [ -f "$cand" ]; then
+      COUNTS_CSV="$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
+sum_train_steps() {
+  local ts0="$1" ts1="$2" global_batch="$3"
+  if [ "$ts1" -lt "$ts0" ]; then
+    echo 0
+    return 0
+  fi
+  resolve_counts_csv || { echo ""; return 0; }
+  python3 - "$COUNTS_CSV" "$ts0" "$ts1" "$global_batch" <<'PY'
+import csv
+import sys
+
+path, ts0, ts1, batch = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+counts = {}
+with open(path, newline="") as f:
+    for row in csv.DictReader(f):
+        counts[int(row["ts"])] = int(row["samples"])
+missing = [ts for ts in range(ts0, ts1 + 1) if ts not in counts]
+if missing:
+    raise SystemExit(f"missing TS in counts CSV: {missing[:10]}")
+print(sum(counts[ts] // batch for ts in range(ts0, ts1 + 1)))
+PY
+}
+
+global_step_start_for() {
+  local ts0="$1" global_batch="$2"
+  local prev_ts=$((ts0 - 1))
+  local prior
+  prior="$(sum_train_steps "$GLOBAL_STEP_BASE_TS" "$prev_ts" "$global_batch")"
+  [ -n "$prior" ] || { echo ""; return 0; }
+  echo $((BASE_GLOBAL_STEP_OFFSET + prior))
+}
+
+estimate_segment_len() {
+  local ts0="$1" train_end="$2" global_batch="$3"
+  resolve_counts_csv || {
+    echo "error: COUNTS_CSV is required for AUTO_SEGMENT_TS=1 or SEGMENT_TS=auto" >&2
+    exit 1
+  }
+  python3 - "$COUNTS_CSV" "$ts0" "$train_end" "$global_batch" "$SEGMENT_TIME_BUDGET" "$TRAIN_SEC_PER_BATCH" <<'PY'
+import csv
+import sys
+
+def parse_time_seconds(value: str) -> float:
+    value = value.strip()
+    if value[-1:].lower() == "s":
+        return float(value[:-1])
+    if value[-1:].lower() == "m":
+        return float(value[:-1]) * 60.0
+    if value[-1:].lower() == "h":
+        return float(value[:-1]) * 3600.0
+    parts = value.split(":")
+    if len(parts) == 3:
+        h, m, s = parts
+        return int(h) * 3600 + int(m) * 60 + float(s)
+    if len(parts) == 2:
+        m, s = parts
+        return int(m) * 60 + float(s)
+    return float(value)
+
+path = sys.argv[1]
+ts0 = int(sys.argv[2])
+train_end = int(sys.argv[3])
+batch = int(sys.argv[4])
+budget = parse_time_seconds(sys.argv[5])
+sec_per_batch = float(sys.argv[6])
+counts = {}
+with open(path, newline="") as f:
+    for row in csv.DictReader(f):
+        counts[int(row["ts"])] = int(row["samples"])
+
+steps = 0
+length = 0
+for ts in range(ts0, train_end + 1):
+    if ts not in counts:
+        raise SystemExit(f"missing TS {ts} in counts CSV")
+    cand = steps + counts[ts] // batch
+    if length > 0 and cand * sec_per_batch > budget:
+        break
+    steps = cand
+    length += 1
+print(max(1, length))
+PY
+}
 
 if [ -z "${MAX_SEQ_LEN:-}" ]; then
   MAX_SEQ_LEN="$(maxseq_for "$HISTORY_LENGTH")" || {
@@ -62,7 +209,12 @@ if [ -z "${SEGMENT_TS:-}" ]; then
     *) echo "error: SEGMENT_TS must be set for HISTORY_LENGTH=$HISTORY_LENGTH" >&2; exit 1 ;;
   esac
 fi
+if [ -n "${EXP_NAME:-}" ] && [ -z "${RUN_GROUP:-}" ]; then
+  RUN_GROUP="$EXP_NAME"
+fi
 RUN_GROUP="${RUN_GROUP:-yambda_prenyx_1n_l${HISTORY_LENGTH}_bs${LOCAL_BATCH_SIZE}_chain_$(date +%Y%m%d_%H%M%S)}"
+EXP_NAME="${EXP_NAME:-$RUN_GROUP}"
+EXP_ROOT="${RUN_BASE}/${EXP_NAME}"
 CHAIN_NAME="${CHAIN_NAME:-l${HISTORY_LENGTH}_bs${LOCAL_BATCH_SIZE}_${NODES}n}"
 CHAINS="${CHAINS:-${CHAIN_NAME}:${NODES}:${LOCAL_BATCH_SIZE}:${HISTORY_LENGTH}:${MAX_SEQ_LEN}:${SEGMENT_TS}}"
 
@@ -104,6 +256,61 @@ build_chain_specs() {
     IFS=,
   done
   IFS="$old_ifs"
+}
+
+manifest_header() {
+  printf '%s\n' 'exp	repeat	segment	submitted_at	job_id	nodes	local_batch_size	history_length	max_seq_len	start_ts	end_ts	num_train_ts	train_steps	global_step_start	global_step_end	eval_holdout_ts	dependency	run_root	ckpt_path	log	metrics_jsonl	slurm_out	branch	commit	time_limit	segment_time_budget	train_sec_per_batch	global_batch_size'
+}
+
+ensure_manifest() {
+  mkdir -p "$(dirname "$MANIFEST")"
+  if [ ! -s "$MANIFEST" ]; then
+    manifest_header >"$MANIFEST"
+  fi
+}
+
+upsert_manifest_row() {
+  local exp_name="$1" repeat="$2" segment="$3" submitted_at="$4" job_id="$5" nodes="$6" bs="$7" hist="$8" maxseq="$9"
+  local start_ts="${10}" end_ts="${11}" num_train_ts="${12}" train_steps="${13}" global_step_start="${14}" global_step_end="${15}"
+  local eval_ts="${16}" dep="${17}" run_root="${18}" ckpt_path="${19}" log="${20}" metrics_jsonl="${21}" slurm_out="${22}"
+  local branch="${23}" commit="${24}" time_limit="${25}" segment_time_budget="${26}" train_sec_per_batch="${27}" global_batch="${28}"
+  local row tmp lock
+  row="$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+    "$exp_name" "$repeat" "$segment" "$submitted_at" "$job_id" "$nodes" "$bs" "$hist" "$maxseq" \
+    "$start_ts" "$end_ts" "$num_train_ts" "$train_steps" "$global_step_start" "$global_step_end" \
+    "$eval_ts" "$dep" "$run_root" "$ckpt_path" "$log" "$metrics_jsonl" "$slurm_out" \
+    "$branch" "$commit" "$time_limit" "$segment_time_budget" "$train_sec_per_batch" "$global_batch")"
+  lock="${MANIFEST}.lock"
+  (
+    flock -x 9
+    ensure_manifest
+    tmp="$(mktemp "${MANIFEST}.tmp.XXXXXX")"
+    awk -F'\t' -v OFS='\t' -v exp_name="$exp_name" -v rep="$repeat" -v seg="$segment" '
+      NR == 1 { print; next }
+      !($1 == exp_name && $2 == rep && $3 == seg) { print }
+    ' "$MANIFEST" >"$tmp"
+    printf '%s\n' "$row" >>"$tmp"
+    mv "$tmp" "$MANIFEST"
+  ) 9>"$lock"
+}
+
+manifest_lookup() {
+  local repeat="$1" segment="$2"
+  [ -f "$MANIFEST" ] || return 1
+  awk -F'\t' -v rep="$repeat" -v seg="$segment" '
+    NR == 1 {
+      for (i = 1; i <= NF; i++) {
+        idx[$i] = i
+      }
+      next
+    }
+    $idx["repeat"] == rep && $idx["segment"] == seg {
+      print $idx["job_id"], $idx["nodes"], $idx["local_batch_size"], $idx["history_length"], \
+        $idx["max_seq_len"], $idx["end_ts"], $idx["ckpt_path"]
+      found = 1
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$MANIFEST" | tail -1
 }
 
 write_submit_script() {
@@ -434,13 +641,15 @@ EOS
 
 submit_segment() {
   local chain="$1" seg_i="$2" ts0="$3" seg_len="$4" ts1="$5" nodes="$6" bs="$7" hist="$8" maxseq="$9" prev_ckpt="${10}" prev_ts="${11}" dep="${12}"
-  local tag run_name run_root ckpt tb log env_log out script job_name job_id
-  tag="$(printf '%03d' "$seg_i")"
-  run_name="${RUN_GROUP}_${chain}_seg${tag}_ts${ts0}_${ts1}"
-  run_root="${RUN_BASE}/${run_name}"
+  local seg_dir run_name run_root ckpt tb log env_log out script job_name job_id
+  local global_batch train_steps global_step_start global_step_end submitted_at commit metrics_jsonl
+  seg_dir="seg${seg_i}"
+  run_name="${EXP_NAME}_${chain}_${seg_dir}_ts${ts0}_${ts1}"
+  run_root="${EXP_ROOT}/${chain}/${seg_dir}"
   ckpt="${run_root}/checkpoints"; tb="${run_root}/tensorboard"; log="${run_root}/train.log"; env_log="${run_root}/environment.log"
+  metrics_jsonl="${run_root}/train.metrics.jsonl"
   out="${run_root}/slurm-%j.out"; script="${run_root}/submit.sh"
-  job_name="$(echo "${ACCOUNT}-yambda.${chain}_${tag}" | tr -c '[:alnum:]_.-' '_')"
+  job_name="$(echo "${ACCOUNT}-yambda.${chain}_${seg_dir}" | tr -c '[:alnum:]_.-' '_')"
   mkdir -p "$run_root"
   write_submit_script "$script" "$chain" "$seg_i" "$ts0" "$seg_len" "$ts1" "$nodes" "$bs" "$hist" "$maxseq" \
     "$prev_ckpt" "$prev_ts" "$run_name" "$run_root" "$ckpt" "$tb" "$log" "$env_log" "$(cache_for "$hist")"
@@ -454,27 +663,93 @@ submit_segment() {
   fi
   job_id="$(sbatch "${args[@]}" "$script")"; job_id="${job_id%%;*}"
   [ -n "$job_id" ] || { echo "sbatch did not return a job id for $chain segment $seg_i" >&2; exit 1; }
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$chain" "$seg_i" "$job_id" "$nodes" "$ts0" "$ts1" "$seg_len" "$FINAL_EVAL_TS" "${dep:-none}" "$run_root" >>"$MANIFEST"
-  printf '%s seg=%s job=%s nodes=%s ts=%s..%s len=%s eval=%s dependency=%s run=%s\n' "$chain" "$seg_i" "$job_id" "$nodes" "$ts0" "$ts1" "$seg_len" "$FINAL_EVAL_TS" "${dep:-none}" "$run_root" >&2
+  global_batch="$(global_batch_for "$nodes" "$bs")"
+  train_steps="$(sum_train_steps "$ts0" "$ts1" "$global_batch")"
+  global_step_start="$(global_step_start_for "$ts0" "$global_batch")"
+  if [ -n "$global_step_start" ] && [ -n "$train_steps" ]; then
+    global_step_end="$((global_step_start + train_steps))"
+  else
+    global_step_end=""
+  fi
+  submitted_at="$(date -Is)"
+  commit="$(git rev-parse HEAD)"
+  upsert_manifest_row \
+    "$EXP_NAME" "$chain" "$seg_i" "$submitted_at" "$job_id" "$nodes" "$bs" "$hist" "$maxseq" \
+    "$ts0" "$ts1" "$seg_len" "$train_steps" "$global_step_start" "$global_step_end" \
+    "$FINAL_EVAL_TS" "${dep:-none}" "$run_root" "$ckpt" "$log" "$metrics_jsonl" "$out" \
+    "$BRANCH" "$commit" "$TIME_LIMIT" "$SEGMENT_TIME_BUDGET" "$TRAIN_SEC_PER_BATCH" "$global_batch"
+  printf '%s seg=%s job=%s nodes=%s ts=%s..%s len=%s steps=%s global_steps=%s..%s eval=%s dependency=%s run=%s\n' \
+    "$chain" "$seg_i" "$job_id" "$nodes" "$ts0" "$ts1" "$seg_len" "${train_steps:-unknown}" \
+    "${global_step_start:-unknown}" "${global_step_end:-unknown}" "$FINAL_EVAL_TS" "${dep:-none}" "$run_root" >&2
   echo "$job_id"
 }
 
 submit_chain() {
   local chain="$1" nodes="$2" bs="$3" hist="$4" maxseq="$5" seg_ts="$6"
-  local jobs prev_job="$INITIAL_DEPENDENCY" prev_ckpt="" prev_ts="" i=0
-  jobs="$(ceil_div "$TOTAL_TRAIN_TS" "$seg_ts")"
-  printf 'chain=%s nodes=%s local_batch_size=%s history_length=%s max_seq_len=%s segment_ts=%s jobs=%s\n' "$chain" "$nodes" "$bs" "$hist" "$maxseq" "$seg_ts" "$jobs"
+  local prev_job="$INITIAL_DEPENDENCY" prev_ckpt="" prev_ts="" i=0 ts0="$BASE_START_TS"
+  printf 'chain=%s nodes=%s local_batch_size=%s history_length=%s max_seq_len=%s segment_ts=%s auto_segment_ts=%s\n' "$chain" "$nodes" "$bs" "$hist" "$maxseq" "$seg_ts" "$AUTO_SEGMENT_TS"
   [ -n "$INITIAL_DEPENDENCY" ] && printf 'chain=%s initial_dependency=%s\n' "$chain" "$INITIAL_DEPENDENCY"
-  while [ "$i" -lt "$jobs" ]; do
-    local ts0 remaining len ts1 job_id tag
-    ts0=$((BASE_START_TS + i * seg_ts)); remaining=$((BASE_START_TS + TOTAL_TRAIN_TS - ts0)); len="$seg_ts"
+  while [ "$ts0" -le "$TRAIN_END_TS" ]; do
+    local remaining len ts1 job_id
+    remaining=$((TRAIN_END_TS - ts0 + 1))
+    if [ "$AUTO_SEGMENT_TS" = 1 ] || [ "$seg_ts" = auto ]; then
+      len="$(estimate_segment_len "$ts0" "$TRAIN_END_TS" "$(global_batch_for "$nodes" "$bs")")"
+    else
+      len="$seg_ts"
+    fi
     [ "$remaining" -lt "$len" ] && len="$remaining"
     ts1=$((ts0 + len - 1))
     job_id="$(submit_segment "$chain" "$i" "$ts0" "$len" "$ts1" "$nodes" "$bs" "$hist" "$maxseq" "$prev_ckpt" "$prev_ts" "$prev_job" | tail -1)"
-    prev_job="$job_id"; tag="$(printf '%03d' "$i")"
-    prev_ckpt="${RUN_BASE}/${RUN_GROUP}_${chain}_seg${tag}_ts${ts0}_${ts1}/checkpoints"; prev_ts="$ts1"; i=$((i + 1))
+    prev_job="$job_id"
+    prev_ckpt="${EXP_ROOT}/${chain}/seg${i}/checkpoints"; prev_ts="$ts1"; i=$((i + 1)); ts0=$((ts1 + 1))
   done
   echo
+}
+
+submit_successor() {
+  local repeat="$1" prev_segment="$2"
+  local spec chain nodes bs hist maxseq seg_ts found=0
+  local prev_job prev_nodes prev_bs prev_hist prev_maxseq prev_end prev_ckpt
+  local next_segment ts0 remaining len ts1 dep job_id
+
+  for spec in "${CHAIN_SPECS[@]}"; do
+    IFS='|' read -r chain nodes bs hist maxseq seg_ts <<<"$spec"
+    if [ "$chain" = "$repeat" ]; then
+      found=1
+      break
+    fi
+  done
+  if [ "$found" != 1 ]; then
+    chain="$repeat"; nodes=""; bs=""; hist=""; maxseq=""; seg_ts="$SEGMENT_TS"
+  fi
+
+  read -r prev_job prev_nodes prev_bs prev_hist prev_maxseq prev_end prev_ckpt < <(manifest_lookup "$repeat" "$prev_segment") || {
+    echo "error: cannot find repeat=$repeat segment=$prev_segment in $MANIFEST" >&2
+    exit 1
+  }
+  nodes="${nodes:-$prev_nodes}"; bs="${bs:-$prev_bs}"; hist="${hist:-$prev_hist}"; maxseq="${maxseq:-$prev_maxseq}"
+  next_segment=$((prev_segment + 1))
+  ts0=$((prev_end + 1))
+  [ "$ts0" -le "$TRAIN_END_TS" ] || {
+    echo "error: successor start TS $ts0 is past TRAIN_END_TS=$TRAIN_END_TS" >&2
+    exit 1
+  }
+  remaining=$((TRAIN_END_TS - ts0 + 1))
+  if [ "$AUTO_SEGMENT_TS" = 1 ] || [ "$seg_ts" = auto ]; then
+    len="$(estimate_segment_len "$ts0" "$TRAIN_END_TS" "$(global_batch_for "$nodes" "$bs")")"
+  else
+    len="$seg_ts"
+  fi
+  [ "$remaining" -lt "$len" ] && len="$remaining"
+  ts1=$((ts0 + len - 1))
+  dep="$INITIAL_DEPENDENCY"
+  if [ "$DEPEND_ON_PREVIOUS_JOB" = 1 ]; then
+    dep="$prev_job"
+  fi
+  printf 'successor repeat=%s prev_segment=%s next_segment=%s ts=%s..%s prev_ckpt=%s prev_ts=%s dependency=%s\n' \
+    "$repeat" "$prev_segment" "$next_segment" "$ts0" "$ts1" "$prev_ckpt" "$prev_end" "${dep:-none}"
+  job_id="$(submit_segment "$repeat" "$next_segment" "$ts0" "$len" "$ts1" "$nodes" "$bs" "$hist" "$maxseq" "$prev_ckpt" "$prev_end" "$dep" | tail -1)"
+  echo "successor_job=$job_id"
 }
 
 build_chain_specs
@@ -482,15 +757,28 @@ build_chain_specs
 
 printf 'branch=%s\ngit_remote=%s\ncommit=%s\n' "$BRANCH" "$GIT_REMOTE" "$(git rev-parse HEAD)"
 git status --short --branch
-printf 'run_group=%s\naccount=%s\npartition=%s\nbase_start_ts=%s\ntrain_end_ts=%s\ntotal_train_ts=%s\nfinal_eval_ts=%s\ntime_limit=%s\n' \
-  "$RUN_GROUP" "$ACCOUNT" "$PARTITION" "$BASE_START_TS" "$TRAIN_END_TS" "$TOTAL_TRAIN_TS" "$FINAL_EVAL_TS" "$TIME_LIMIT"
+resolve_counts_csv || true
+printf 'run_group=%s\nexp_name=%s\nexp_root=%s\naccount=%s\npartition=%s\nbase_start_ts=%s\ntrain_end_ts=%s\ntotal_train_ts=%s\nfinal_eval_ts=%s\ntime_limit=%s\n' \
+  "$RUN_GROUP" "$EXP_NAME" "$EXP_ROOT" "$ACCOUNT" "$PARTITION" "$BASE_START_TS" "$TRAIN_END_TS" "$TOTAL_TRAIN_TS" "$FINAL_EVAL_TS" "$TIME_LIMIT"
+printf 'counts_csv=%s\nauto_segment_ts=%s\nsegment_time_budget=%s\ntrain_sec_per_batch=%s\nglobal_step_base_ts=%s\nbase_global_step_offset=%s\n' \
+  "${COUNTS_CSV:-<unset>}" "$AUTO_SEGMENT_TS" "$SEGMENT_TIME_BUDGET" "$TRAIN_SEC_PER_BATCH" "$GLOBAL_STEP_BASE_TS" "$BASE_GLOBAL_STEP_OFFSET"
 printf 'enroot_name=%s\ncleanup_enroot_on_exit=%s\nchains=%s\n\n' "${ENROOT_NAME:-<default>}" "${CLEANUP_ENROOT_ON_EXIT:-<default>}" "$CHAINS"
 
-MANIFEST="${RUN_BASE}/${RUN_GROUP}/jobs.tsv"
-mkdir -p "$(dirname "$MANIFEST")"
-printf 'chain\tsegment\tjob_id\tnodes\tstart_ts\tend_ts\tnum_train_ts\teval_holdout_ts\tdependency\trun_root\n' >"$MANIFEST"
-for spec in "${CHAIN_SPECS[@]}"; do
-  IFS='|' read -r chain nodes bs hist maxseq seg_ts <<<"$spec"
-  submit_chain "$chain" "$nodes" "$bs" "$hist" "$maxseq" "$seg_ts"
-done
+MANIFEST="${EXP_ROOT}/jobs.tsv"
+ensure_manifest
+if [ -n "$SUCCESSOR_OF" ]; then
+  IFS=: read -r SUCCESSOR_REPEAT SUCCESSOR_SEGMENT <<<"$SUCCESSOR_OF"
+fi
+if [ -n "$SUCCESSOR_REPEAT" ] || [ -n "$SUCCESSOR_SEGMENT" ]; then
+  [ -n "$SUCCESSOR_REPEAT" ] && [ -n "$SUCCESSOR_SEGMENT" ] || {
+    echo "error: set SUCCESSOR_OF=repeat:segment or both SUCCESSOR_REPEAT and SUCCESSOR_SEGMENT" >&2
+    exit 1
+  }
+  submit_successor "$SUCCESSOR_REPEAT" "$SUCCESSOR_SEGMENT"
+else
+  for spec in "${CHAIN_SPECS[@]}"; do
+    IFS='|' read -r chain nodes bs hist maxseq seg_ts <<<"$spec"
+    submit_chain "$chain" "$nodes" "$bs" "$hist" "$maxseq" "$seg_ts"
+  done
+fi
 echo "manifest=$MANIFEST"

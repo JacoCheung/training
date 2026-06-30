@@ -589,8 +589,9 @@ def _maybe_apply_qcomm_a2a(
     forward_precision: str = "fp32",
     backward_precision: str = "fp32",
     lowmem_clamp_cast: bool = True,
+    use_index_dedup: bool = False,
 ) -> List[Any]:
-    """Optionally quantize the embedding all-to-all payload via TorchRec qcomm.
+    """Configure the EC sharder for optional index dedup and qcomm.
 
     The yambda-5b embedding shuffle is the dominant, bandwidth-bound (multi-node)
     collective (~14.5 GB/rank fp32); a bf16/fp16 wire dtype halves it. Quant/
@@ -606,9 +607,10 @@ def _maybe_apply_qcomm_a2a(
     bf16 and fp16 are both 2 bytes, so the wire volume / perf is identical — the
     choice is purely numerical.
 
-    Args (set via gin on ``make_optimizer_and_shard``, env-overridable). Each is
-    one of ``fp32`` (that direction unquantized) | ``bf16`` | ``fp16``. If BOTH
-    are fp32 the sharders are returned untouched (identical to baseline trunk).
+    Precision args are set via gin on ``make_optimizer_and_shard`` and are each
+    one of ``fp32`` (that direction unquantized) | ``bf16`` | ``fp16``. If both
+    are fp32 and index dedup is disabled, the sharders are returned untouched
+    (identical to baseline trunk).
     """
     _COMM = {"bf16": "BF16", "fp16": "FP16", "fp32": "FP32"}
     fwd = (forward_precision or "fp32").strip().lower()
@@ -622,7 +624,8 @@ def _maybe_apply_qcomm_a2a(
                 f"DLRMV4 qcomm a2a: unknown {name} precision {p!r} "
                 f"(want one of fp32|bf16|fp16)"
             )
-    if fwd == "fp32" and bwd == "fp32":
+    qcomm_enabled = fwd != "fp32" or bwd != "fp32"
+    if not qcomm_enabled and not use_index_dedup:
         return sharders
     # Before building the codec, swap fbgemm's clamp+cast for a memory-frugal
     # equivalent — see _patch_fbgemm_lowmem_clamp_cast for why (avoids a full
@@ -631,51 +634,59 @@ def _maybe_apply_qcomm_a2a(
     _patch_fbgemm_lowmem_clamp_cast(enabled=lowmem_clamp_cast, rank0=rank0)
     try:
         from torchrec.distributed.embedding import EmbeddingCollectionSharder
-        from torchrec.distributed.fbgemm_qcomm_codec import (
-            CommType,
-            get_qcomm_codecs_registry,
-            QCommsConfig,
-        )
 
-        qcfg = QCommsConfig(
-            forward_precision=getattr(CommType, _COMM[fwd]),
-            backward_precision=getattr(CommType, _COMM[bwd]),
-        )
-        registry = get_qcomm_codecs_registry(qcfg, device=device)
+        registry = None
+        if qcomm_enabled:
+            from torchrec.distributed.fbgemm_qcomm_codec import (
+                CommType,
+                get_qcomm_codecs_registry,
+                QCommsConfig,
+            )
+
+            qcfg = QCommsConfig(
+                forward_precision=getattr(CommType, _COMM[fwd]),
+                backward_precision=getattr(CommType, _COMM[bwd]),
+            )
+            registry = get_qcomm_codecs_registry(qcfg, device=device)
     except Exception as e:  # noqa: BLE001
-        # A configured quantized a2a that fails to build is a hard error. Silently
-        # downgrading to fp32 would change numerics/throughput with no signal, and
-        # a partial failure (one rank fp32, others fp16) would also desync the
-        # collectives. Raise on every rank so the whole job aborts consistently.
+        # Any requested EC sharder option that fails to build is a hard error.
+        # Silently dropping dedup or downgrading qcomm to fp32 would change the
+        # configured behavior with no signal. Raise on every rank so the whole
+        # job aborts consistently.
         raise RuntimeError(
-            f"DLRMV4 qcomm a2a: failed to enable configured quantization "
-            f"(forward={fwd} backward={bwd}): {type(e).__name__}: {e}"
+            f"DLRMV4 EC sharder: failed to apply configuration "
+            f"(index_dedup={use_index_dedup}, qcomm_forward={fwd}, "
+            f"qcomm_backward={bwd}): {type(e).__name__}: {e}"
         ) from e
 
     new_sharders = []
     replaced = False
     for s in sharders:
         if type(s).__name__ == "EmbeddingCollectionSharder" and not replaced:
-            new_sharders.append(
-                EmbeddingCollectionSharder(qcomm_codecs_registry=registry)
-            )
+            sharder_kwargs: Dict[str, Any] = {
+                "use_index_dedup": use_index_dedup,
+            }
+            if registry is not None:
+                sharder_kwargs["qcomm_codecs_registry"] = registry
+            new_sharders.append(EmbeddingCollectionSharder(**sharder_kwargs))
             replaced = True
         else:
             new_sharders.append(s)
     if not replaced:
-        # Codec registry built fine, but there was no EmbeddingCollectionSharder to
-        # bind it to, so the quantized a2a would be silently inert. Treat this as a
-        # hard failure too — "configured but not applied" is the bug we want caught.
+        # Configuration resolved fine, but there was no EmbeddingCollectionSharder
+        # to bind it to. Treat this as a hard failure — "configured but not applied"
+        # is the bug we want caught.
         raise RuntimeError(
-            f"DLRMV4 qcomm a2a: quantization configured (forward={fwd} "
-            f"backward={bwd}) but no EmbeddingCollectionSharder was found to attach "
-            f"the qcomm codec registry to; refusing to run with quantization "
-            f"silently disabled"
+            f"DLRMV4 EC sharder: configuration requested (index_dedup="
+            f"{use_index_dedup}, qcomm_forward={fwd}, qcomm_backward={bwd}) but "
+            f"no EmbeddingCollectionSharder was found; refusing to continue with "
+            f"the requested configuration silently disabled"
         )
     if rank0:
         logger.info(
-            "DLRMV4 qcomm a2a ENABLED: forward=%s backward=%s "
-            "replaced_ec_sharder=%s",
+            "DLRMV4 EC sharder configured: index_dedup=%s "
+            "qcomm_forward=%s qcomm_backward=%s replaced_ec_sharder=%s",
+            use_index_dedup,
             fwd,
             bwd,
             replaced,
@@ -809,6 +820,7 @@ def make_optimizer_and_shard(
     sparse_a2a_forward_precision: str = "fp32",
     sparse_a2a_backward_precision: str = "fp32",
     qcomm_lowmem_clamp_cast: bool = True,
+    enable_dedup: int = 0,
     embedding_placement: str = "auto",
     embedding_placement_overrides: Optional[Dict[str, str]] = None,
     embedding_sharding_overrides: Optional[Dict[str, str]] = None,
@@ -829,6 +841,20 @@ def make_optimizer_and_shard(
                     apply_optimizer_in_backward(
                         sparse_opt_cls, [param], sparse_opt_args
                     )
+    if enable_dedup not in (0, 1):
+        raise ValueError(
+            f"enable_dedup must be 0 or 1, got {enable_dedup} "
+            "(set via $ENABLE_DEDUP)"
+        )
+    use_index_dedup = enable_dedup == 1
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    if rank == 0:
+        logger.info(
+            "[ec-sharder] use_index_dedup=%s (ENABLE_DEDUP=%s)",
+            use_index_dedup,
+            enable_dedup,
+        )
+
     sharders = get_default_sharders()
     sharders = _maybe_apply_qcomm_a2a(
         sharders,
@@ -836,6 +862,7 @@ def make_optimizer_and_shard(
         forward_precision=sparse_a2a_forward_precision,
         backward_precision=sparse_a2a_backward_precision,
         lowmem_clamp_cast=qcomm_lowmem_clamp_cast,
+        use_index_dedup=use_index_dedup,
     )
     # local_world_size = GPUs per node so the planner respects the intra-node
     # (xGMI/NVLink) vs inter-node hierarchy when placing shards. Defaults to

@@ -104,7 +104,7 @@ mkdir -p "$(dirname "$LOG")"
   echo "[$(date)] launch_local: dataset=$DATASET mode=$MODE smoke=$SMOKE"
   echo "[$(date)] PYTHON=$PYTHON"
   echo "[$(date)] DLRM_DATA_PATH=$DLRM_DATA_PATH"
-  echo "[$(date)] streaming: START_TS=${START_TS:-<gin-default>} NUM_TRAIN_TS=${NUM_TRAIN_TS:-<gin-default>} INTER_WINDOW_SHUFFLE=${INTER_WINDOW_SHUFFLE:-<unset>} SEED=${SEED:-<gin-default>}"
+  echo "[$(date)] streaming: START_TS=${START_TS:-<gin-default>} NUM_TRAIN_TS=${NUM_TRAIN_TS:-<gin-default>} INTER_WINDOW_SHUFFLE=${INTER_WINDOW_SHUFFLE:-<unset>} SEED=${SEED:-<gin-default>} ENABLE_DROPOUT=${ENABLE_DROPOUT:-<gin-default:1>} ENABLE_DEDUP=${ENABLE_DEDUP:-<gin-default:0>}"
   echo "[$(date)] topology: nnodes=$NNODES node_rank=$NODE_RANK gpus_per_node(req)=$GPUS_PER_NODE master=$MASTER_ADDR:${MASTER_PORT:-<auto>}"
 } | tee -a "$LOG"
 

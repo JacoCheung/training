@@ -65,6 +65,7 @@ def get_hstu_configs(
     hstu_attn_qk_dim: Optional[int] = None,
     hstu_input_dropout_ratio: Optional[float] = None,
     hstu_linear_dropout_rate: Optional[float] = None,
+    enable_dropout: int = 1,
 ) -> DlrmHSTUConfig:
     """
     Create and return HSTU model configuration.
@@ -75,6 +76,8 @@ def get_hstu_configs(
 
     Args:
         dataset: Dataset identifier (currently unused, reserved for dataset-specific configs).
+        enable_dropout: Master HSTU dropout switch. ``0`` forces all configured
+            HSTU dropout ratios to zero; ``1`` preserves their configured values.
 
     Returns:
         DlrmHSTUConfig: Complete configuration object for the HSTU model.
@@ -509,6 +512,15 @@ def get_hstu_configs(
     for _name, _val in _gin_overrides.items():
         if _val is not None:
             setattr(hstu_config, _name, _val)
+
+    if enable_dropout not in (0, 1):
+        raise ValueError(
+            f"enable_dropout must be 0 or 1, got {enable_dropout} "
+            "(set via $ENABLE_DROPOUT)"
+        )
+    if enable_dropout == 0:
+        hstu_config.hstu_input_dropout_ratio = 0.0
+        hstu_config.hstu_linear_dropout_rate = 0.0
 
     return hstu_config
 

@@ -261,6 +261,8 @@ enforce the correct type for each parameter.
 | Grad clip max-norm | `GRAD_CLIP_NORM` | `streaming_train_eval_loop.grad_clip_norm` | float | 1.0 | float >= 0 (0 disables) |
 | RNG seed | `SEED` | `seed_everything.seed` | int | 1 | any integer (-1 = random per run) |
 | HSTU attention layers | `HSTU_NUM_LAYERS` | `get_hstu_configs.hstu_attn_num_layers` | int | 3 | positive integer |
+| HSTU dropout | `ENABLE_DROPOUT` | `get_hstu_configs.enable_dropout` | int | 1 | 0 disables input and per-layer output dropout; 1 enables configured ratios |
+| Embedding index dedup | `ENABLE_DEDUP` | `make_optimizer_and_shard.enable_dedup` | int | 0 | 0 disables; 1 sets `EmbeddingCollectionSharder.use_index_dedup=True` |
 | UIH history length | `HISTORY_LENGTH` | `get_dataset.history_length` | int | 4086 | positive integer (per-pool cap = L//3) |
 | Max sequence length | `MAX_SEQ_LEN` | `get_hstu_configs.max_seq_len` | int | 4096 | positive integer (>= `history_length + 9`) |
 | History strategy | `HISTORY_STRATEGY` | `get_dataset.history_strategy` | str | `interleaved` | one of `interleaved` \| `last_n` |

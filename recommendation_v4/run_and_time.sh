@@ -13,6 +13,8 @@
 # Env (run shape / cadence -- defaults are the FULL reference sweep):
 #   DLRM_DATA_PATH        data root (required).
 #   SEED                  RNG seed (default 1).
+#   ENABLE_DROPOUT        HSTU dropout master switch (default 1; 0 disables).
+#   ENABLE_DEDUP          embedding index dedup switch (default 0; 1 enables).
 #   START_TS / NUM_TRAIN_TS   window range (default 0 / 299 = full sweep).
 #   EVAL_EVERY_DATA_PCT   eval cadence as a fraction of train data (default 0.005).
 #   AUC_THRESHOLD         convergence target (default 0.80275).
@@ -27,6 +29,8 @@ cd "${REPO_ROOT}"
 
 # ---- Reference run shape (full sweep to the quality target) -----------------
 export SEED="${SEED:-1}"
+export ENABLE_DROPOUT="${ENABLE_DROPOUT:-1}"
+export ENABLE_DEDUP="${ENABLE_DEDUP:-0}"
 export START_TS="${START_TS:-0}"
 export NUM_TRAIN_TS="${NUM_TRAIN_TS:-299}"
 export NUM_TRAIN_BATCHES="${NUM_TRAIN_BATCHES:-0}"

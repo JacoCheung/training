@@ -220,6 +220,13 @@ esh/env_str_map.key     = "EMB_SHARDING_OVERRIDES"
 esh/env_str_map.merge   = True
 esh/env_str_map.default = {}
 
+# EmbeddingCollection index deduplication. Disabled by default to preserve the
+# existing input distribution path; set $ENABLE_DEDUP=1 to enable TorchRec's
+# EmbeddingCollectionSharder(use_index_dedup=True).
+make_optimizer_and_shard.enable_dedup = @dedup/env_int()
+dedup/env_int.key     = "ENABLE_DEDUP"
+dedup/env_int.default = 0
+
 # Sparse embedding all-to-all wire precision. The embedding shuffle is the
 # dominant, bandwidth-bound (esp. multi-node) collective; quantizing it via
 # TorchRec QCommsConfig halves (bf16/fp16, both 2 bytes) the wire volume.
@@ -389,6 +396,13 @@ msl/env_int.default = 4096
 get_hstu_configs.hstu_attn_num_layers = @nl/env_int()
 nl/env_int.key     = "HSTU_NUM_LAYERS"
 nl/env_int.default = 3
+
+# Master switch for all HSTU dropout. The model defaults remain input=0.2 and
+# per-layer output=0.1 when enabled. Setting $ENABLE_DROPOUT=0 forces both
+# ratios to 0.0 in get_hstu_configs after all ratio overrides are applied.
+get_hstu_configs.enable_dropout = @ed/env_int()
+ed/env_int.key     = "ENABLE_DROPOUT"
+ed/env_int.default = 1
 
 # --- streaming (temporal-order) training -------------------------------------
 # Only consumed under `--mode streaming-train-eval`; the default train-eval

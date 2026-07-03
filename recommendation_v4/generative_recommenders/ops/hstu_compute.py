@@ -39,6 +39,7 @@ except ImportError:
     triton_cc_group_norm_mul_dropout_wrapper = None
     triton_cc_layer_norm_mul_dropout_wrapper = None
 from generative_recommenders.common import HammerKernel
+from generative_recommenders.ops.cutedsl_hstu_attention import cutedsl_hstu_enabled
 from generative_recommenders.ops.hstu_attention import hstu_mha, hstu_mha_cuda
 from generative_recommenders.ops.triton.triton_hstu_linear import (
     triton_hstu_compute_output,
@@ -110,9 +111,12 @@ def hstu_compute_uqvk(
             eps=norm_eps,
             kernel=kernel,
         )
-        # NOTE: for AMD training, we go with torch.addmm instead of the triton
-        # version before Triton on AMD achieves on-par perf with NV GPU.
-        if torch.version.hip and kernel == HammerKernel.TRITON:
+        # The devel_latest Blackwell image's Triton addmm does not compile with
+        # its PyTorch/Triton pairing. CUTEDSL only replaces attention, so keep
+        # this projection on the native PyTorch CUDA matmul path.
+        if kernel == HammerKernel.TRITON and (
+            torch.version.hip or cutedsl_hstu_enabled()
+        ):
             uvqk = torch.addmm(uvqk_bias, normed_x, uvqk_weight)
         else:
             uvqk = addmm(uvqk_bias, normed_x, uvqk_weight, kernel)
@@ -333,7 +337,11 @@ def hstu_preprocess_and_attention(
             contextual_seq_len=contextual_seq_len,
         ).view(-1, hidden_dim * num_heads)
         return u, attn_output, k, v
-    if kernel == HammerKernel.TRITON and prefill is False:
+    if (
+        kernel == HammerKernel.TRITON
+        and prefill is False
+        and not cutedsl_hstu_enabled()
+    ):
         u, attn_output = triton_hstu_preprocess_and_attention(
             x=x,
             norm_weight=norm_weight,

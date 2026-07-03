@@ -16,9 +16,11 @@
 
 # pyre-strict
 
+import os
 import random
 import unittest
 from typing import Optional
+from unittest import mock
 
 import torch
 from generative_recommenders.common import (
@@ -254,6 +256,29 @@ def test_delta_attn(
 
 
 class HSTUAttentionTest(unittest.TestCase):
+    def test_cutedsl_env_dispatch(self) -> None:
+        from generative_recommenders.ops.hstu_attention import hstu_mha
+
+        q = torch.zeros((2, 1, 64))
+        seq_offsets = torch.tensor((0, 2), dtype=torch.int64)
+        expected = torch.ones_like(q)
+        with mock.patch.dict(os.environ, {"ENABLE_CUTEDSL_HSTU": "1"}), mock.patch(
+            "generative_recommenders.ops.hstu_attention.cutedsl_hstu_mha",
+            return_value=expected,
+        ) as cutedsl_mock:
+            actual = hstu_mha(
+                max_seq_len=2,
+                alpha=0.125,
+                q=q,
+                k=q,
+                v=q,
+                seq_offsets=seq_offsets,
+                kernel=HammerKernel.TRITON,
+            )
+
+        self.assertIs(actual, expected)
+        cutedsl_mock.assert_called_once()
+
     @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore
     @given(

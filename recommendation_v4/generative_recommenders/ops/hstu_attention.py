@@ -20,6 +20,10 @@ from typing import Optional
 
 import torch
 from generative_recommenders.common import HammerKernel, switch_to_contiguous_if_needed
+from generative_recommenders.ops.cutedsl_hstu_attention import (
+    cutedsl_hstu_enabled,
+    cutedsl_hstu_mha,
+)
 from generative_recommenders.ops.pytorch.pt_hstu_attention import (
     pytorch_cached_hstu_mha,
     pytorch_hstu_mha,
@@ -151,6 +155,25 @@ def hstu_mha(
         torch._assert(v.shape[0] == q.shape[0], "wrong v shape[0]")
         torch._assert(v.shape[1] == H, "wrong v shape[1]")
         torch._assert(causal, "only support causal attention")
+
+    if cutedsl_hstu_enabled():
+        if is_fx_tracing():
+            raise RuntimeError("CUTEDSL HSTU attention does not support FX tracing")
+        return cutedsl_hstu_mha(
+            max_seq_len=max_seq_len,
+            alpha=alpha,
+            q=q,
+            k=k,
+            v=v,
+            seq_offsets=seq_offsets,
+            causal=causal,
+            dropout_pr=dropout_pr,
+            num_targets=num_targets,
+            attn_scale=attn_scale,
+            max_attn_len=max_attn_len,
+            contextual_seq_len=contextual_seq_len,
+            min_full_attn_seq_len=min_full_attn_seq_len,
+        )
 
     if kernel in [
         HammerKernel.TRITON,

@@ -23,19 +23,43 @@ from typing import Any, Callable, Optional, Tuple
 import torch
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
+_DLPACK_DIM_LIMIT = 1 << 31
+_WORKSPACE_INNER_DIM = 128
 
 
 def cutedsl_hstu_enabled() -> bool:
     return os.getenv("ENABLE_CUTEDSL_HSTU", "0").strip().lower() in _TRUE_VALUES
 
 
+def _patch_large_workspace_dlpack(hstu_ops_gpu: Any) -> None:
+    original_from_dlpack = hstu_ops_gpu.from_dlpack
+    if getattr(original_from_dlpack, "_hstu_large_workspace_compatible", False):
+        return
+
+    @functools.wraps(original_from_dlpack)
+    def compatible_from_dlpack(tensor: Any, *args: Any, **kwargs: Any) -> Any:
+        # CUTLASS DSL uses signed 32-bit memref dimensions. The HSTU backward
+        # workspace is byte-addressed, so an equivalent 2-D view avoids a
+        # dimension overflow without changing its storage or kernel iterator.
+        if (
+            isinstance(tensor, torch.Tensor)
+            and tensor.dtype == torch.uint8
+            and tensor.ndim == 1
+            and tensor.numel() >= _DLPACK_DIM_LIMIT
+        ):
+            if tensor.numel() % _WORKSPACE_INNER_DIM != 0:
+                raise RuntimeError("CUTEDSL HSTU workspace is not 128-byte aligned")
+            tensor = tensor.view(-1, _WORKSPACE_INNER_DIM)
+        return original_from_dlpack(tensor, *args, **kwargs)
+
+    compatible_from_dlpack._hstu_large_workspace_compatible = True
+    hstu_ops_gpu.from_dlpack = compatible_from_dlpack
+
+
 @functools.lru_cache(maxsize=1)
 def _load_cutedsl_hstu_ops() -> Tuple[Callable[..., Any], Callable[..., Any]]:
     try:
-        from hstu.hstu_blackwell.hstu_ops_gpu import (
-            hstu_varlen_bwd_100,
-            hstu_varlen_fwd_100,
-        )
+        from hstu.hstu_blackwell import hstu_ops_gpu
     except (ImportError, AttributeError) as error:
         raise ImportError(
             "ENABLE_CUTEDSL_HSTU=1 requires the Blackwell hstu package and a "
@@ -43,7 +67,8 @@ def _load_cutedsl_hstu_ops() -> Tuple[Callable[..., Any], Callable[..., Any]]:
             "distributed-recommender:devel_latest setup uses "
             "nvidia-cutlass-dsl==4.4.2."
         ) from error
-    return hstu_varlen_fwd_100, hstu_varlen_bwd_100
+    _patch_large_workspace_dlpack(hstu_ops_gpu)
+    return hstu_ops_gpu.hstu_varlen_fwd_100, hstu_ops_gpu.hstu_varlen_bwd_100
 
 
 class _CuteDslHstuAttention(torch.autograd.Function):

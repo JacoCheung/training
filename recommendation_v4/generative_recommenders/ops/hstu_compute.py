@@ -111,12 +111,28 @@ def hstu_compute_uqvk(
             eps=norm_eps,
             kernel=kernel,
         )
+        split_sizes = [
+            hidden_dim * num_heads,
+            hidden_dim * num_heads,
+            attn_dim * num_heads,
+            attn_dim * num_heads,
+        ]
+        if cutedsl_hstu_enabled():
+            weights = torch.split(uvqk_weight, split_sizes, dim=1)
+            biases = torch.split(uvqk_bias, split_sizes, dim=0)
+            u, v, q, k = tuple(
+                torch.addmm(bias, normed_x, weight)
+                for bias, weight in zip(biases, weights)
+            )
+            u = F.silu(u)
+            q = q.view(-1, num_heads, attn_dim)
+            k = k.view(-1, num_heads, attn_dim)
+            v = v.view(-1, num_heads, hidden_dim)
+            return u, q, k, v
         # The devel_latest Blackwell image's Triton addmm does not compile with
         # its PyTorch/Triton pairing. CUTEDSL only replaces attention, so keep
         # this projection on the native PyTorch CUDA matmul path.
-        if kernel == HammerKernel.TRITON and (
-            torch.version.hip or cutedsl_hstu_enabled()
-        ):
+        if kernel == HammerKernel.TRITON and torch.version.hip:
             uvqk = torch.addmm(uvqk_bias, normed_x, uvqk_weight)
         else:
             uvqk = addmm(uvqk_bias, normed_x, uvqk_weight, kernel)

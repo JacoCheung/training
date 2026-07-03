@@ -25,6 +25,7 @@ import torch
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _DLPACK_DIM_LIMIT = 1 << 31
 _WORKSPACE_INNER_DIM = 128
+_LARGE_WORKSPACE_BYTES = 1 << 33
 
 
 def cutedsl_hstu_enabled() -> bool:
@@ -166,6 +167,23 @@ class _CuteDslHstuAttention(torch.autograd.Function):
             None,
             False,
         )
+        workspace_bytes = (
+            ctx.max_seq_len
+            * q.shape[1]
+            * q.shape[2]
+            * (seq_offsets.numel() - 1)
+            * 4
+        )
+        if (
+            workspace_bytes >= _LARGE_WORKSPACE_BYTES
+            and os.getenv("NCCL_DMABUF_ENABLE", "0").strip().lower()
+            in _TRUE_VALUES
+        ):
+            # The CUTEDSL dQ workspace has no live references after hstu_bwd,
+            # but its cached 8+ GiB segment is invisible to NCCL's allocator.
+            # Return that free segment to CUDA before TorchRec's sparse
+            # backward allocates its DMABUF communication buffers.
+            torch.cuda.empty_cache()
         return dq, dk, dv, None, None, None, None, None
 
 

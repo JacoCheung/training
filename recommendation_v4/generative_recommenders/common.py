@@ -126,7 +126,7 @@ class HammerKernel(Enum):
 
 @contextlib.contextmanager
 def profile_range(name: str) -> Iterator[None]:
-    """Emit a PyTorch profiler annotation plus an NVTX range for Nsight Systems."""
+    """Emit the explicitly requested manual NVTX range (currently to_device)."""
     compiler = getattr(torch, "compiler", None)
     is_compiling = compiler is not None and compiler.is_compiling()
     if torch.jit.is_scripting() or is_compiling:

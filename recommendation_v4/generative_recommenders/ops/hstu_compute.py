@@ -42,7 +42,6 @@ from generative_recommenders.common import (
     HammerKernel,
     nvtx_range_end_tensor,
     nvtx_range_start,
-    profile_range,
 )
 from generative_recommenders.ops.cutedsl_hstu_attention import cutedsl_hstu_enabled
 from generative_recommenders.ops.hstu_attention import hstu_mha, hstu_mha_cuda
@@ -125,14 +124,13 @@ def hstu_compute_uqvk(
             v.view(-1, num_heads, hidden_dim),
         )
     else:
-        with profile_range("yambda_hstu/hstu/compute_uqvk/layer_norm"):
-            normed_x = layer_norm(
-                x,
-                weight=norm_weight,
-                bias=norm_bias,
-                eps=norm_eps,
-                kernel=kernel,
-            )
+        normed_x = layer_norm(
+            x,
+            weight=norm_weight,
+            bias=norm_bias,
+            eps=norm_eps,
+            kernel=kernel,
+        )
         split_sizes = [
             hidden_dim * num_heads,
             hidden_dim * num_heads,
@@ -140,42 +138,38 @@ def hstu_compute_uqvk(
             attn_dim * num_heads,
         ]
         if cutedsl_hstu_enabled():
-            with profile_range("yambda_hstu/hstu/compute_uqvk/addmm"):
-                weights = torch.split(uvqk_weight, split_sizes, dim=1)
-                biases = torch.split(uvqk_bias, split_sizes, dim=0)
-                u, v, q, k = tuple(
-                    torch.addmm(bias, normed_x, weight)
-                    for bias, weight in zip(biases, weights)
-                )
-            with profile_range("yambda_hstu/hstu/compute_uqvk/split_reshape"):
-                u = F.silu(u)
-                q = q.view(-1, num_heads, attn_dim)
-                k = k.view(-1, num_heads, attn_dim)
-                v = v.view(-1, num_heads, hidden_dim)
+            weights = torch.split(uvqk_weight, split_sizes, dim=1)
+            biases = torch.split(uvqk_bias, split_sizes, dim=0)
+            u, v, q, k = tuple(
+                torch.addmm(bias, normed_x, weight)
+                for bias, weight in zip(biases, weights)
+            )
+            u = F.silu(u)
+            q = q.view(-1, num_heads, attn_dim)
+            k = k.view(-1, num_heads, attn_dim)
+            v = v.view(-1, num_heads, hidden_dim)
             return u, q, k, v
         # The devel_latest Blackwell image's Triton addmm does not compile with
         # its PyTorch/Triton pairing. CUTEDSL only replaces attention, so keep
         # this projection on the native PyTorch CUDA matmul path.
-        with profile_range("yambda_hstu/hstu/compute_uqvk/addmm"):
-            if torch.version.hip and kernel == HammerKernel.TRITON:
-                uvqk = torch.addmm(uvqk_bias, normed_x, uvqk_weight)
-            else:
-                uvqk = addmm(uvqk_bias, normed_x, uvqk_weight, kernel)
-    with profile_range("yambda_hstu/hstu/compute_uqvk/split_reshape"):
-        u, v, q, k = torch.split(
-            uvqk,
-            [
-                hidden_dim * num_heads,
-                hidden_dim * num_heads,
-                attn_dim * num_heads,
-                attn_dim * num_heads,
-            ],
-            dim=1,
-        )
-        u = F.silu(u)
-        q = q.view(-1, num_heads, attn_dim)
-        k = k.view(-1, num_heads, attn_dim)
-        v = v.view(-1, num_heads, hidden_dim)
+        if torch.version.hip and kernel == HammerKernel.TRITON:
+            uvqk = torch.addmm(uvqk_bias, normed_x, uvqk_weight)
+        else:
+            uvqk = addmm(uvqk_bias, normed_x, uvqk_weight, kernel)
+    u, v, q, k = torch.split(
+        uvqk,
+        [
+            hidden_dim * num_heads,
+            hidden_dim * num_heads,
+            attn_dim * num_heads,
+            attn_dim * num_heads,
+        ],
+        dim=1,
+    )
+    u = F.silu(u)
+    q = q.view(-1, num_heads, attn_dim)
+    k = k.view(-1, num_heads, attn_dim)
+    v = v.view(-1, num_heads, hidden_dim)
     return u, q, k, v
 
 
@@ -218,32 +212,31 @@ def hstu_compute_output(
         )
     if kernel == HammerKernel.TRITON:
         triton_output_nvtx = nvtx_range_start(
-            "yambda_hstu/hstu/output/triton",
+            "hstu/output/triton",
             attn,
         )
-        with profile_range("yambda_hstu/hstu/output/triton"):
-            output = triton_hstu_compute_output(
-                attn=attn,
-                u=u,
-                x=x,
-                norm_weight=norm_weight,
-                norm_bias=norm_bias,
-                output_weight=output_weight,
-                eps=norm_eps,
-                dropout_ratio=dropout_ratio,
-                training=training,
-                concat_u=concat_u,
-                concat_x=concat_x,
-                mul_u_activation_type=mul_u_activation_type,
-                group_norm=group_norm,
-                num_heads=num_heads,
-                linear_dim=linear_dim,
-                seed=None,
-                recompute_y_in_backward=recompute_y_in_backward,
-            )
+        output = triton_hstu_compute_output(
+            attn=attn,
+            u=u,
+            x=x,
+            norm_weight=norm_weight,
+            norm_bias=norm_bias,
+            output_weight=output_weight,
+            eps=norm_eps,
+            dropout_ratio=dropout_ratio,
+            training=training,
+            concat_u=concat_u,
+            concat_x=concat_x,
+            mul_u_activation_type=mul_u_activation_type,
+            group_norm=group_norm,
+            num_heads=num_heads,
+            linear_dim=linear_dim,
+            seed=None,
+            recompute_y_in_backward=recompute_y_in_backward,
+        )
         return nvtx_range_end_tensor(
             output,
-            "yambda_hstu/hstu/output/triton",
+            "hstu/output/triton",
             triton_output_nvtx,
         )
     elif kernel == HammerKernel.TRITON_INFERENCE:
@@ -272,61 +265,57 @@ def hstu_compute_output(
                 concat_ux=concat_u and concat_x,
                 mul_u_activation_type=mul_u_activation_type,
             )
-        with profile_range("yambda_hstu/hstu/output/triton_inference_addmm"):
-            return addmm(x, y, output_weight, kernel)
+        return addmm(x, y, output_weight, kernel)
     elif kernel == HammerKernel.TRITON_CC:
         if triton_cc_group_norm_mul_dropout_wrapper is None or triton_cc_addmm is None:
             raise ImportError(
                 "hammer is required for the TRITON_CC kernel in hstu_compute_output."
             )
-        with profile_range("yambda_hstu/hstu/output/triton_cc_norm_dropout"):
-            if group_norm:
-                y = triton_cc_group_norm_mul_dropout_wrapper(
-                    x=attn,
-                    u=u,
-                    weight=norm_weight,
-                    bias=norm_bias,
-                    eps=norm_eps,
-                    dropout_ratio=dropout_ratio,
-                    training=training,
-                    concat_ux=concat_u and concat_x,
-                    num_heads=num_heads,
-                    linear_dim=linear_dim,
-                )
-            else:
-                y = triton_cc_layer_norm_mul_dropout_wrapper(
-                    x=attn,
-                    u=u,
-                    weight=norm_weight,
-                    bias=norm_bias,
-                    eps=norm_eps,
-                    dropout_ratio=dropout_ratio,
-                    training=training,
-                    concat_u=concat_u,
-                    concat_x=concat_x,
-                    mul_u_activation_type=mul_u_activation_type,
-                )
-        with profile_range("yambda_hstu/hstu/output/triton_cc_addmm"):
-            return triton_cc_addmm(x, y, output_weight)
-    else:
-        with profile_range("yambda_hstu/hstu/output/pytorch"):
-            return pytorch_hstu_compute_output(
-                attn=attn,
+        if group_norm:
+            y = triton_cc_group_norm_mul_dropout_wrapper(
+                x=attn,
                 u=u,
-                x=x,
-                norm_weight=norm_weight,
-                norm_bias=norm_bias,
-                output_weight=output_weight,
+                weight=norm_weight,
+                bias=norm_bias,
+                eps=norm_eps,
+                dropout_ratio=dropout_ratio,
+                training=training,
+                concat_ux=concat_u and concat_x,
+                num_heads=num_heads,
+                linear_dim=linear_dim,
+            )
+        else:
+            y = triton_cc_layer_norm_mul_dropout_wrapper(
+                x=attn,
+                u=u,
+                weight=norm_weight,
+                bias=norm_bias,
                 eps=norm_eps,
                 dropout_ratio=dropout_ratio,
                 training=training,
                 concat_u=concat_u,
                 concat_x=concat_x,
                 mul_u_activation_type=mul_u_activation_type,
-                group_norm=group_norm,
-                num_heads=num_heads,
-                linear_dim=linear_dim,
             )
+        return triton_cc_addmm(x, y, output_weight)
+    else:
+        return pytorch_hstu_compute_output(
+            attn=attn,
+            u=u,
+            x=x,
+            norm_weight=norm_weight,
+            norm_bias=norm_bias,
+            output_weight=output_weight,
+            eps=norm_eps,
+            dropout_ratio=dropout_ratio,
+            training=training,
+            concat_u=concat_u,
+            concat_x=concat_x,
+            mul_u_activation_type=mul_u_activation_type,
+            group_norm=group_norm,
+            num_heads=num_heads,
+            linear_dim=linear_dim,
+        )
 
 
 def hstu_preprocess_and_attention(
@@ -399,68 +388,65 @@ def hstu_preprocess_and_attention(
         and not cutedsl_hstu_enabled()
     ):
         fused_preprocess_attention_nvtx = nvtx_range_start(
-            "yambda_hstu/hstu/fused_preprocess_attention/triton",
+            "hstu/fused_preprocess_attention/triton",
             x,
         )
-        with profile_range("yambda_hstu/hstu/fused_preprocess_attention/triton"):
-            u, attn_output = triton_hstu_preprocess_and_attention(
-                x=x,
-                norm_weight=norm_weight,
-                norm_bias=norm_bias,
-                norm_eps=norm_eps,
-                num_heads=num_heads,
-                attn_dim=attn_dim,
-                hidden_dim=hidden_dim,
-                uvqk_weight=uvqk_weight,
-                uvqk_bias=uvqk_bias,
-                max_seq_len=max_seq_len,
-                seq_offsets=seq_offsets,
-                attn_alpha=attn_alpha,
-                num_targets=num_targets,
-                max_attn_len=max_attn_len,
-                contextual_seq_len=contextual_seq_len,
-                recompute_uvqk_in_backward=recompute_uvqk_in_backward,
-                recompute_normed_x_in_backward=recompute_normed_x_in_backward,
-                sort_by_length=sort_by_length,
-                enable_tma=enable_tma,
-            )
+        u, attn_output = triton_hstu_preprocess_and_attention(
+            x=x,
+            norm_weight=norm_weight,
+            norm_bias=norm_bias,
+            norm_eps=norm_eps,
+            num_heads=num_heads,
+            attn_dim=attn_dim,
+            hidden_dim=hidden_dim,
+            uvqk_weight=uvqk_weight,
+            uvqk_bias=uvqk_bias,
+            max_seq_len=max_seq_len,
+            seq_offsets=seq_offsets,
+            attn_alpha=attn_alpha,
+            num_targets=num_targets,
+            max_attn_len=max_attn_len,
+            contextual_seq_len=contextual_seq_len,
+            recompute_uvqk_in_backward=recompute_uvqk_in_backward,
+            recompute_normed_x_in_backward=recompute_normed_x_in_backward,
+            sort_by_length=sort_by_length,
+            enable_tma=enable_tma,
+        )
         attn_output = attn_output.view(-1, hidden_dim * num_heads)
         attn_output = nvtx_range_end_tensor(
             attn_output,
-            "yambda_hstu/hstu/fused_preprocess_attention/triton",
+            "hstu/fused_preprocess_attention/triton",
             fused_preprocess_attention_nvtx,
         )
         k = None
         v = None
     else:
-        with profile_range("yambda_hstu/hstu/unfused_preprocess/compute_uqvk"):
-            u, q, k, v = hstu_compute_uqvk(
-                x=x,
-                norm_weight=norm_weight,
-                norm_bias=norm_bias,
-                norm_eps=norm_eps,
-                num_heads=num_heads,
-                attn_dim=attn_dim,
-                hidden_dim=hidden_dim,
-                uvqk_weight=uvqk_weight,
-                uvqk_bias=uvqk_bias,
-                kernel=kernel,
-            )
-        with profile_range("yambda_hstu/hstu/unfused_attention"):
-            attn_output = hstu_mha(
-                max_seq_len=max_seq_len,
-                alpha=attn_alpha,
-                q=q,
-                k=k,
-                v=v,
-                seq_offsets=seq_offsets,
-                causal=causal,
-                dropout_pr=0.0,
-                training=False,
-                num_targets=num_targets,
-                max_attn_len=max_attn_len,
-                contextual_seq_len=contextual_seq_len,
-                sort_by_length=sort_by_length,
-                kernel=kernel,
-            ).view(-1, hidden_dim * num_heads)
+        u, q, k, v = hstu_compute_uqvk(
+            x=x,
+            norm_weight=norm_weight,
+            norm_bias=norm_bias,
+            norm_eps=norm_eps,
+            num_heads=num_heads,
+            attn_dim=attn_dim,
+            hidden_dim=hidden_dim,
+            uvqk_weight=uvqk_weight,
+            uvqk_bias=uvqk_bias,
+            kernel=kernel,
+        )
+        attn_output = hstu_mha(
+            max_seq_len=max_seq_len,
+            alpha=attn_alpha,
+            q=q,
+            k=k,
+            v=v,
+            seq_offsets=seq_offsets,
+            causal=causal,
+            dropout_pr=0.0,
+            training=False,
+            num_targets=num_targets,
+            max_attn_len=max_attn_len,
+            contextual_seq_len=contextual_seq_len,
+            sort_by_length=sort_by_length,
+            kernel=kernel,
+        ).view(-1, hidden_dim * num_heads)
     return u, attn_output, k, v

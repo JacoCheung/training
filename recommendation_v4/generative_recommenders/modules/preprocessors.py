@@ -26,7 +26,6 @@ from generative_recommenders.common import (
     HammerModule,
     init_mlp_weights_optional_bias,
     jagged_to_padded_dense,
-    profile_range,
 )
 from generative_recommenders.modules.action_encoder import ActionEncoder
 from generative_recommenders.ops.jagged_tensors import concat_2D_jagged
@@ -227,40 +226,36 @@ class ContextualPreprocessor(InputPreprocessor):
         torch.Tensor,
         Dict[str, torch.Tensor],
     ]:
-        with profile_range("yambda_hstu/hstu/preprocess/content_mlp"):
-            output_seq_embeddings = self._content_embedding_mlp(seq_embeddings)
+        output_seq_embeddings = self._content_embedding_mlp(seq_embeddings)
         if len(self._additional_embedding_features) > 0:
-            with profile_range("yambda_hstu/hstu/preprocess/additional_embeddings"):
-                additional_embeddings = torch.cat(
-                    [
-                        seq_payloads[feature]
-                        for feature in self._additional_embedding_features
-                    ],
-                    dim=1,
-                )
-                output_seq_embeddings = (
-                    output_seq_embeddings
-                    + self._additional_embedding_mlp(additional_embeddings)
-                )
+            additional_embeddings = torch.cat(
+                [
+                    seq_payloads[feature]
+                    for feature in self._additional_embedding_features
+                ],
+                dim=1,
+            )
+            output_seq_embeddings = (
+                output_seq_embeddings
+                + self._additional_embedding_mlp(additional_embeddings)
+            )
         max_seq_len = max_uih_len + max_targets
-        with profile_range("yambda_hstu/hstu/preprocess/fbgemm_offsets"):
-            target_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(num_targets)
-            seq_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(seq_lengths)
-            uih_offsets = seq_offsets - target_offsets
+        target_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(num_targets)
+        seq_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(seq_lengths)
+        uih_offsets = seq_offsets - target_offsets
         if self._action_weights is not None:
-            with profile_range("yambda_hstu/hstu/preprocess/action_embeddings"):
-                action_embeddings = self._action_encoder(
-                    max_uih_len=max_uih_len,
-                    max_targets=max_targets,
-                    uih_offsets=uih_offsets,
-                    target_offsets=target_offsets,
-                    seq_embeddings=seq_embeddings,
-                    seq_payloads=seq_payloads,
-                )
-                output_seq_embeddings = (
-                    output_seq_embeddings
-                    + self._action_embedding_mlp(action_embeddings)
-                )
+            action_embeddings = self._action_encoder(
+                max_uih_len=max_uih_len,
+                max_targets=max_targets,
+                uih_offsets=uih_offsets,
+                target_offsets=target_offsets,
+                seq_embeddings=seq_embeddings,
+                seq_payloads=seq_payloads,
+            )
+            output_seq_embeddings = (
+                output_seq_embeddings
+                + self._action_embedding_mlp(action_embeddings)
+            )
 
         output_max_seq_len = max_seq_len
         output_total_uih_len = total_uih_len
@@ -268,70 +263,66 @@ class ContextualPreprocessor(InputPreprocessor):
         output_seq_lengths = seq_lengths
         output_num_targets = num_targets
         output_seq_timestamps = seq_timestamps
-        with profile_range("yambda_hstu/hstu/preprocess/output_offsets"):
+        output_seq_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
+            output_seq_lengths
+        )
+        # concat contextual embeddings
+        if self._max_contextual_seq_len > 0:
+            contextual_input_embeddings = get_contextual_input_embeddings(
+                seq_lengths=seq_lengths,
+                seq_payloads=seq_payloads,
+                contextual_feature_to_max_length=self._contextual_feature_to_max_length,
+                contextual_feature_to_min_uih_length=self._contextual_feature_to_min_uih_length,
+                dtype=seq_embeddings.dtype,
+            )
+            contextual_embeddings = torch.baddbmm(
+                self._batched_contextual_linear_bias.view(
+                    -1, 1, self._output_embedding_dim
+                ).to(contextual_input_embeddings.dtype),
+                contextual_input_embeddings.view(
+                    -1, self._max_contextual_seq_len, self._input_embedding_dim
+                ).transpose(0, 1),
+                self._batched_contextual_linear_weights.to(
+                    contextual_input_embeddings.dtype
+                ),
+            ).transpose(0, 1)
+            output_seq_embeddings = concat_2D_jagged(
+                max_seq_len=self._max_contextual_seq_len + output_max_seq_len,
+                values_left=fx_unwrap_optional_tensor(
+                    contextual_embeddings
+                ).reshape(
+                    -1, self._output_embedding_dim
+                ),
+                values_right=output_seq_embeddings,
+                max_len_left=self._max_contextual_seq_len,
+                max_len_right=output_max_seq_len,
+                offsets_left=None,
+                offsets_right=output_seq_offsets,
+                kernel=self.hammer_kernel(),
+            )
+            output_seq_timestamps = concat_2D_jagged(
+                max_seq_len=self._max_contextual_seq_len + output_max_seq_len,
+                values_left=torch.zeros(
+                    (
+                        output_seq_lengths.size(0)
+                        * self._max_contextual_seq_len,
+                        1,
+                    ),
+                    dtype=output_seq_timestamps.dtype,
+                    device=output_seq_timestamps.device,
+                ),
+                values_right=output_seq_timestamps.unsqueeze(-1),
+                max_len_left=self._max_contextual_seq_len,
+                max_len_right=output_max_seq_len,
+                offsets_left=None,
+                offsets_right=output_seq_offsets,
+                kernel=self.hammer_kernel(),
+            ).squeeze(-1)
+            output_max_seq_len = output_max_seq_len + self._max_contextual_seq_len
+            output_seq_lengths = output_seq_lengths + self._max_contextual_seq_len
             output_seq_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
                 output_seq_lengths
             )
-        # concat contextual embeddings
-        if self._max_contextual_seq_len > 0:
-            with profile_range("yambda_hstu/hstu/preprocess/contextual_embeddings"):
-                contextual_input_embeddings = get_contextual_input_embeddings(
-                    seq_lengths=seq_lengths,
-                    seq_payloads=seq_payloads,
-                    contextual_feature_to_max_length=self._contextual_feature_to_max_length,
-                    contextual_feature_to_min_uih_length=self._contextual_feature_to_min_uih_length,
-                    dtype=seq_embeddings.dtype,
-                )
-                contextual_embeddings = torch.baddbmm(
-                    self._batched_contextual_linear_bias.view(
-                        -1, 1, self._output_embedding_dim
-                    ).to(contextual_input_embeddings.dtype),
-                    contextual_input_embeddings.view(
-                        -1, self._max_contextual_seq_len, self._input_embedding_dim
-                    ).transpose(0, 1),
-                    self._batched_contextual_linear_weights.to(
-                        contextual_input_embeddings.dtype
-                    ),
-                ).transpose(0, 1)
-            with profile_range("yambda_hstu/hstu/preprocess/contextual_concat"):
-                output_seq_embeddings = concat_2D_jagged(
-                    max_seq_len=self._max_contextual_seq_len + output_max_seq_len,
-                    values_left=fx_unwrap_optional_tensor(
-                        contextual_embeddings
-                    ).reshape(
-                        -1, self._output_embedding_dim
-                    ),
-                    values_right=output_seq_embeddings,
-                    max_len_left=self._max_contextual_seq_len,
-                    max_len_right=output_max_seq_len,
-                    offsets_left=None,
-                    offsets_right=output_seq_offsets,
-                    kernel=self.hammer_kernel(),
-                )
-                output_seq_timestamps = concat_2D_jagged(
-                    max_seq_len=self._max_contextual_seq_len + output_max_seq_len,
-                    values_left=torch.zeros(
-                        (
-                            output_seq_lengths.size(0)
-                            * self._max_contextual_seq_len,
-                            1,
-                        ),
-                        dtype=output_seq_timestamps.dtype,
-                        device=output_seq_timestamps.device,
-                    ),
-                    values_right=output_seq_timestamps.unsqueeze(-1),
-                    max_len_left=self._max_contextual_seq_len,
-                    max_len_right=output_max_seq_len,
-                    offsets_left=None,
-                    offsets_right=output_seq_offsets,
-                    kernel=self.hammer_kernel(),
-                ).squeeze(-1)
-            output_max_seq_len = output_max_seq_len + self._max_contextual_seq_len
-            output_seq_lengths = output_seq_lengths + self._max_contextual_seq_len
-            with profile_range("yambda_hstu/hstu/preprocess/contextual_offsets"):
-                output_seq_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
-                    output_seq_lengths
-                )
             output_total_uih_len = (
                 output_total_uih_len
                 + self._max_contextual_seq_len * output_seq_lengths.size(0)

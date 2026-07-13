@@ -25,7 +25,6 @@ from generative_recommenders.common import (
     HammerModule,
     nvtx_range_end_tensor,
     nvtx_range_start,
-    profile_range,
 )
 from generative_recommenders.ops.hstu_attention import delta_hstu_mha
 from generative_recommenders.ops.hstu_compute import (
@@ -305,73 +304,70 @@ class STULayer(STU):
         kv_caching_lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         preprocess_attention_nvtx = nvtx_range_start(
-            "yambda_hstu/hstu/layer/preprocess_and_attention",
+            "hstu/layer/preprocess_and_attention",
             x,
         )
-        with profile_range("yambda_hstu/hstu/layer/preprocess_and_attention"):
-            u, attn_output, k, v = hstu_preprocess_and_attention(
-                x=x,
-                norm_weight=self._input_norm_weight.to(x.dtype),
-                norm_bias=self._input_norm_bias.to(x.dtype),
-                norm_eps=1e-6,
-                num_heads=self._num_heads,
-                attn_dim=self._attention_dim,
-                hidden_dim=self._hidden_dim,
-                uvqk_weight=self._uvqk_weight.to(x.dtype),
-                uvqk_bias=self._uvqk_beta.to(x.dtype),
-                max_seq_len=max_seq_len,
-                seq_offsets=x_offsets,
-                attn_alpha=self._attn_alpha,
-                causal=self._causal,
-                num_targets=num_targets if self._target_aware else None,
-                max_attn_len=self._max_attn_len,
-                contextual_seq_len=self._contextual_seq_len,
-                recompute_uvqk_in_backward=self._recompute_uvqk,
-                recompute_normed_x_in_backward=self._recompute_normed_x,
-                sort_by_length=self._sort_by_length,
-                prefill=kv_caching_lengths is not None,
-                kernel=self.hammer_kernel(),
-            )
+        u, attn_output, k, v = hstu_preprocess_and_attention(
+            x=x,
+            norm_weight=self._input_norm_weight.to(x.dtype),
+            norm_bias=self._input_norm_bias.to(x.dtype),
+            norm_eps=1e-6,
+            num_heads=self._num_heads,
+            attn_dim=self._attention_dim,
+            hidden_dim=self._hidden_dim,
+            uvqk_weight=self._uvqk_weight.to(x.dtype),
+            uvqk_bias=self._uvqk_beta.to(x.dtype),
+            max_seq_len=max_seq_len,
+            seq_offsets=x_offsets,
+            attn_alpha=self._attn_alpha,
+            causal=self._causal,
+            num_targets=num_targets if self._target_aware else None,
+            max_attn_len=self._max_attn_len,
+            contextual_seq_len=self._contextual_seq_len,
+            recompute_uvqk_in_backward=self._recompute_uvqk,
+            recompute_normed_x_in_backward=self._recompute_normed_x,
+            sort_by_length=self._sort_by_length,
+            prefill=kv_caching_lengths is not None,
+            kernel=self.hammer_kernel(),
+        )
         attn_output = nvtx_range_end_tensor(
             attn_output,
-            "yambda_hstu/hstu/layer/preprocess_and_attention",
+            "hstu/layer/preprocess_and_attention",
             preprocess_attention_nvtx,
         )
 
-        with profile_range("yambda_hstu/hstu/layer/update_kv_cache"):
-            self.update_kv_cache(
-                max_seq_len=max_seq_len,
-                seq_offsets=x_offsets,
-                k=k,
-                v=v,
-                max_kv_caching_len=max_kv_caching_len,
-                kv_caching_lengths=kv_caching_lengths,
-            )
+        self.update_kv_cache(
+            max_seq_len=max_seq_len,
+            seq_offsets=x_offsets,
+            k=k,
+            v=v,
+            max_kv_caching_len=max_kv_caching_len,
+            kv_caching_lengths=kv_caching_lengths,
+        )
 
-        output_nvtx = nvtx_range_start("yambda_hstu/hstu/layer/output", attn_output)
-        with profile_range("yambda_hstu/hstu/layer/output"):
-            output = hstu_compute_output(
-                attn=attn_output,
-                u=u,
-                x=x,
-                norm_weight=self._output_norm_weight.to(x.dtype),
-                norm_bias=self._output_norm_bias.to(x.dtype),
-                norm_eps=1e-6,
-                dropout_ratio=self._output_dropout_ratio,
-                output_weight=self._output_weight.to(x.dtype),
-                group_norm=self._use_group_norm,
-                num_heads=self._num_heads,
-                linear_dim=self._hidden_dim,
-                concat_u=True,
-                concat_x=True,
-                mul_u_activation_type="none",
-                training=self.training,
-                kernel=self.hammer_kernel(),
-                recompute_y_in_backward=self._recompute_y,
-            )
+        output_nvtx = nvtx_range_start("hstu/layer/output", attn_output)
+        output = hstu_compute_output(
+            attn=attn_output,
+            u=u,
+            x=x,
+            norm_weight=self._output_norm_weight.to(x.dtype),
+            norm_bias=self._output_norm_bias.to(x.dtype),
+            norm_eps=1e-6,
+            dropout_ratio=self._output_dropout_ratio,
+            output_weight=self._output_weight.to(x.dtype),
+            group_norm=self._use_group_norm,
+            num_heads=self._num_heads,
+            linear_dim=self._hidden_dim,
+            concat_u=True,
+            concat_x=True,
+            mul_u_activation_type="none",
+            training=self.training,
+            kernel=self.hammer_kernel(),
+            recompute_y_in_backward=self._recompute_y,
+        )
         return nvtx_range_end_tensor(
             output,
-            "yambda_hstu/hstu/layer/output",
+            "hstu/layer/output",
             output_nvtx,
         )
 
@@ -382,68 +378,63 @@ class STULayer(STU):
         max_kv_caching_len: int = 0,
         kv_caching_lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        with profile_range("yambda_hstu/hstu/cached/compute_uqvk"):
-            delta_u, delta_q, delta_k, delta_v = hstu_compute_uqvk(
-                x=delta_x,
-                norm_weight=self._input_norm_weight.to(delta_x.dtype),
-                norm_bias=self._input_norm_bias.to(delta_x.dtype),
-                norm_eps=1e-6,
-                num_heads=self._num_heads,
-                attn_dim=self._attention_dim,
-                hidden_dim=self._hidden_dim,
-                uvqk_weight=self._uvqk_weight.to(delta_x.dtype),
-                uvqk_bias=self._uvqk_beta.to(delta_x.dtype),
-                kernel=self.hammer_kernel(),
-            )
-        with profile_range("yambda_hstu/hstu/cached/construct_full_kv"):
-            k, v, max_seq_len, seq_offsets = self.construct_full_kv(
-                delta_k=delta_k.flatten(1, 2),
-                delta_v=delta_v.flatten(1, 2),
-            )
-        with profile_range("yambda_hstu/hstu/cached/update_kv_cache"):
-            self.update_kv_cache(
-                max_seq_len=max_seq_len,
-                seq_offsets=seq_offsets,
-                k=k,
-                v=v,
-                max_kv_caching_len=max_kv_caching_len,
-                kv_caching_lengths=kv_caching_lengths,
-            )
+        delta_u, delta_q, delta_k, delta_v = hstu_compute_uqvk(
+            x=delta_x,
+            norm_weight=self._input_norm_weight.to(delta_x.dtype),
+            norm_bias=self._input_norm_bias.to(delta_x.dtype),
+            norm_eps=1e-6,
+            num_heads=self._num_heads,
+            attn_dim=self._attention_dim,
+            hidden_dim=self._hidden_dim,
+            uvqk_weight=self._uvqk_weight.to(delta_x.dtype),
+            uvqk_bias=self._uvqk_beta.to(delta_x.dtype),
+            kernel=self.hammer_kernel(),
+        )
+        k, v, max_seq_len, seq_offsets = self.construct_full_kv(
+            delta_k=delta_k.flatten(1, 2),
+            delta_v=delta_v.flatten(1, 2),
+        )
+        self.update_kv_cache(
+            max_seq_len=max_seq_len,
+            seq_offsets=seq_offsets,
+            k=k,
+            v=v,
+            max_kv_caching_len=max_kv_caching_len,
+            kv_caching_lengths=kv_caching_lengths,
+        )
         k = k.view(-1, self._num_heads, self._attention_dim)
         v = v.view(-1, self._num_heads, self._hidden_dim)
-        with profile_range("yambda_hstu/hstu/cached/attention"):
-            delta_attn_output = delta_hstu_mha(
-                max_seq_len=max_seq_len,
-                alpha=self._attn_alpha,
-                delta_q=delta_q,
-                k=k,
-                v=v,
-                seq_offsets=seq_offsets,
-                num_targets=num_targets if self._target_aware else None,
-                max_attn_len=self._max_attn_len,
-                contextual_seq_len=self._contextual_seq_len,
-                kernel=self.hammer_kernel(),
-            ).view(-1, self._hidden_dim * self._num_heads)
-        with profile_range("yambda_hstu/hstu/cached/output"):
-            return hstu_compute_output(
-                attn=delta_attn_output,
-                u=delta_u,
-                x=delta_x,
-                norm_weight=self._output_norm_weight.to(delta_x.dtype),
-                norm_bias=self._output_norm_bias.to(delta_x.dtype),
-                norm_eps=1e-6,
-                dropout_ratio=self._output_dropout_ratio,
-                output_weight=self._output_weight.to(delta_x.dtype),
-                group_norm=self._use_group_norm,
-                num_heads=self._num_heads,
-                linear_dim=self._hidden_dim,
-                concat_u=True,
-                concat_x=True,
-                mul_u_activation_type="none",
-                training=self.training,
-                kernel=self.hammer_kernel(),
-                recompute_y_in_backward=self._recompute_y,
-            )
+        delta_attn_output = delta_hstu_mha(
+            max_seq_len=max_seq_len,
+            alpha=self._attn_alpha,
+            delta_q=delta_q,
+            k=k,
+            v=v,
+            seq_offsets=seq_offsets,
+            num_targets=num_targets if self._target_aware else None,
+            max_attn_len=self._max_attn_len,
+            contextual_seq_len=self._contextual_seq_len,
+            kernel=self.hammer_kernel(),
+        ).view(-1, self._hidden_dim * self._num_heads)
+        return hstu_compute_output(
+            attn=delta_attn_output,
+            u=delta_u,
+            x=delta_x,
+            norm_weight=self._output_norm_weight.to(delta_x.dtype),
+            norm_bias=self._output_norm_bias.to(delta_x.dtype),
+            norm_eps=1e-6,
+            dropout_ratio=self._output_dropout_ratio,
+            output_weight=self._output_weight.to(delta_x.dtype),
+            group_norm=self._use_group_norm,
+            num_heads=self._num_heads,
+            linear_dim=self._hidden_dim,
+            concat_u=True,
+            concat_x=True,
+            mul_u_activation_type="none",
+            training=self.training,
+            kernel=self.hammer_kernel(),
+            recompute_y_in_backward=self._recompute_y,
+        )
 
 
 class STUStack(STU):
@@ -466,18 +457,17 @@ class STUStack(STU):
         kv_caching_lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         for i, layer in enumerate(self._stu_layers):
-            layer_tag = f"yambda_hstu/hstu/layer_{i:02d}"
+            layer_tag = f"hstu/layer_{i:02d}"
             layer_nvtx = nvtx_range_start(layer_tag, x)
-            with profile_range(layer_tag):
-                x = layer(
-                    x=x,
-                    x_lengths=x_lengths,
-                    x_offsets=x_offsets,
-                    max_seq_len=max_seq_len,
-                    num_targets=num_targets,
-                    max_kv_caching_len=max_kv_caching_len,
-                    kv_caching_lengths=kv_caching_lengths,
-                )
+            x = layer(
+                x=x,
+                x_lengths=x_lengths,
+                x_offsets=x_offsets,
+                max_seq_len=max_seq_len,
+                num_targets=num_targets,
+                max_kv_caching_len=max_kv_caching_len,
+                kv_caching_lengths=kv_caching_lengths,
+            )
             x = nvtx_range_end_tensor(x, layer_tag, layer_nvtx)
         return x
 
@@ -489,11 +479,10 @@ class STUStack(STU):
         kv_caching_lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         for i, layer in enumerate(self._stu_layers):
-            with profile_range(f"yambda_hstu/hstu/cached/layer_{i:02d}"):
-                delta_x = layer.cached_forward(  # pyre-ignore [29]
-                    delta_x=delta_x,
-                    num_targets=num_targets,
-                    max_kv_caching_len=max_kv_caching_len,
-                    kv_caching_lengths=kv_caching_lengths,
-                )
+            delta_x = layer.cached_forward(  # pyre-ignore [29]
+                delta_x=delta_x,
+                num_targets=num_targets,
+                max_kv_caching_len=max_kv_caching_len,
+                kv_caching_lengths=kv_caching_lengths,
+            )
         return delta_x

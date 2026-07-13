@@ -25,7 +25,6 @@ from generative_recommenders.common import (
     HammerModule,
     nvtx_range_end_tensor,
     nvtx_range_start,
-    profile_range,
 )
 from generative_recommenders.modules.positional_encoder import HSTUPositionalEncoder
 from generative_recommenders.modules.postprocessors import (
@@ -120,74 +119,71 @@ class HSTUTransducer(HammerModule):
         seq_payloads = default_seq_payload(seq_payloads)
 
         input_preprocessor_nvtx = nvtx_range_start(
-            "yambda_hstu/hstu/input_preprocessor",
+            "hstu/input_preprocessor",
             seq_embeddings,
         )
-        with profile_range("yambda_hstu/hstu/input_preprocessor"):
-            (
-                output_max_seq_len,
-                output_total_uih_len,
-                output_total_targets,
-                output_seq_lengths,
-                output_seq_offsets,
-                output_seq_timestamps,
-                output_seq_embeddings,
-                output_num_targets,
-                output_seq_payloads,
-            ) = self._input_preprocessor(
-                max_uih_len=max_uih_len,
-                max_targets=max_targets,
-                total_uih_len=total_uih_len,
-                total_targets=total_targets,
-                seq_lengths=seq_lengths,
-                seq_timestamps=seq_timestamps,
-                seq_embeddings=seq_embeddings,
-                num_targets=num_targets,
-                seq_payloads=seq_payloads,
-            )
+        (
+            output_max_seq_len,
+            output_total_uih_len,
+            output_total_targets,
+            output_seq_lengths,
+            output_seq_offsets,
+            output_seq_timestamps,
+            output_seq_embeddings,
+            output_num_targets,
+            output_seq_payloads,
+        ) = self._input_preprocessor(
+            max_uih_len=max_uih_len,
+            max_targets=max_targets,
+            total_uih_len=total_uih_len,
+            total_targets=total_targets,
+            seq_lengths=seq_lengths,
+            seq_timestamps=seq_timestamps,
+            seq_embeddings=seq_embeddings,
+            num_targets=num_targets,
+            seq_payloads=seq_payloads,
+        )
         output_seq_embeddings = nvtx_range_end_tensor(
             output_seq_embeddings,
-            "yambda_hstu/hstu/input_preprocessor",
+            "hstu/input_preprocessor",
             input_preprocessor_nvtx,
         )
 
-        with profile_range("yambda_hstu/hstu/positional_encoder"):
-            if self._positional_encoder is not None:
-                positional_encoder_nvtx = nvtx_range_start(
-                    "yambda_hstu/hstu/positional_encoder",
-                    output_seq_embeddings,
-                )
-                output_seq_embeddings = self._positional_encoder(
-                    max_seq_len=output_max_seq_len,
-                    seq_lengths=output_seq_lengths,
-                    seq_offsets=output_seq_offsets,
-                    seq_timestamps=output_seq_timestamps,
-                    seq_embeddings=output_seq_embeddings,
-                    num_targets=(
-                        None if self._listwise_training else output_num_targets
-                    ),
-                )
-                output_seq_embeddings = nvtx_range_end_tensor(
-                    output_seq_embeddings,
-                    "yambda_hstu/hstu/positional_encoder",
-                    positional_encoder_nvtx,
-                )
-
-        with profile_range("yambda_hstu/hstu/input_dropout"):
-            input_dropout_nvtx = nvtx_range_start(
-                "yambda_hstu/hstu/input_dropout",
+        if self._positional_encoder is not None:
+            positional_encoder_nvtx = nvtx_range_start(
+                "hstu/positional_encoder",
                 output_seq_embeddings,
             )
-            output_seq_embeddings = torch.nn.functional.dropout(
-                output_seq_embeddings,
-                p=self._input_dropout_ratio,
-                training=self.training,
+            output_seq_embeddings = self._positional_encoder(
+                max_seq_len=output_max_seq_len,
+                seq_lengths=output_seq_lengths,
+                seq_offsets=output_seq_offsets,
+                seq_timestamps=output_seq_timestamps,
+                seq_embeddings=output_seq_embeddings,
+                num_targets=(
+                    None if self._listwise_training else output_num_targets
+                ),
             )
             output_seq_embeddings = nvtx_range_end_tensor(
                 output_seq_embeddings,
-                "yambda_hstu/hstu/input_dropout",
-                input_dropout_nvtx,
+                "hstu/positional_encoder",
+                positional_encoder_nvtx,
             )
+
+        input_dropout_nvtx = nvtx_range_start(
+            "hstu/input_dropout",
+            output_seq_embeddings,
+        )
+        output_seq_embeddings = torch.nn.functional.dropout(
+            output_seq_embeddings,
+            p=self._input_dropout_ratio,
+            training=self.training,
+        )
+        output_seq_embeddings = nvtx_range_end_tensor(
+            output_seq_embeddings,
+            "hstu/input_dropout",
+            input_dropout_nvtx,
+        )
 
         return (
             output_max_seq_len,
@@ -210,18 +206,17 @@ class HSTUTransducer(HammerModule):
         seq_embeddings: torch.Tensor,
         num_targets: torch.Tensor,
     ) -> torch.Tensor:
-        stack_nvtx = nvtx_range_start("yambda_hstu/hstu/stack", seq_embeddings)
-        with profile_range("yambda_hstu/hstu/stack"):
-            seq_embeddings = self._stu_module(
-                max_seq_len=max_seq_len,
-                x=seq_embeddings,
-                x_lengths=seq_lengths,
-                x_offsets=seq_offsets,
-                num_targets=(None if self._listwise_training else num_targets),
-            )
+        stack_nvtx = nvtx_range_start("hstu/stack", seq_embeddings)
+        seq_embeddings = self._stu_module(
+            max_seq_len=max_seq_len,
+            x=seq_embeddings,
+            x_lengths=seq_lengths,
+            x_offsets=seq_offsets,
+            num_targets=(None if self._listwise_training else num_targets),
+        )
         seq_embeddings = nvtx_range_end_tensor(
             seq_embeddings,
-            "yambda_hstu/hstu/stack",
+            "hstu/stack",
             stack_nvtx,
         )
         return seq_embeddings
@@ -240,24 +235,40 @@ class HSTUTransducer(HammerModule):
         seq_payloads: Dict[str, torch.Tensor],
     ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
         output_postprocessor_nvtx = nvtx_range_start(
-            "yambda_hstu/hstu/output_postprocessor",
+            "hstu/output_postprocessor",
             seq_embeddings,
         )
-        with profile_range("yambda_hstu/hstu/output_postprocessor"):
-            if self._return_full_embeddings:
-                seq_embeddings = self._output_postprocessor(
-                    seq_embeddings=seq_embeddings,
-                    seq_timestamps=seq_timestamps,
-                    seq_payloads=seq_payloads,
-                )
-            uih_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
-                seq_lengths - num_targets
+        if self._return_full_embeddings:
+            seq_embeddings = self._output_postprocessor(
+                seq_embeddings=seq_embeddings,
+                seq_timestamps=seq_timestamps,
+                seq_payloads=seq_payloads,
             )
-            candidates_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
-                num_targets
-            )
-            _, candidate_embeddings = split_2D_jagged(
-                values=seq_embeddings,
+        uih_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
+            seq_lengths - num_targets
+        )
+        candidates_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
+            num_targets
+        )
+        _, candidate_embeddings = split_2D_jagged(
+            values=seq_embeddings,
+            max_seq_len=max_seq_len,
+            total_len_left=total_uih_len,
+            total_len_right=total_targets,
+            max_len_left=max_uih_len,
+            max_len_right=max_targets,
+            offsets_left=uih_offsets,
+            offsets_right=candidates_offsets,
+            kernel=self.hammer_kernel(),
+        )
+        interleave_targets: bool = self._input_preprocessor.interleave_targets()
+        if interleave_targets:
+            candidate_embeddings = candidate_embeddings.view(
+                -1, 2, candidate_embeddings.size(-1)
+            )[:, 0, :]
+        if not self._return_full_embeddings:
+            _, candidate_timestamps = split_2D_jagged(
+                values=seq_timestamps.unsqueeze(-1),
                 max_seq_len=max_seq_len,
                 total_len_left=total_uih_len,
                 total_len_right=total_targets,
@@ -267,41 +278,24 @@ class HSTUTransducer(HammerModule):
                 offsets_right=candidates_offsets,
                 kernel=self.hammer_kernel(),
             )
-            interleave_targets: bool = self._input_preprocessor.interleave_targets()
+            candidate_timestamps = candidate_timestamps.squeeze(-1)
             if interleave_targets:
-                candidate_embeddings = candidate_embeddings.view(
-                    -1, 2, candidate_embeddings.size(-1)
-                )[:, 0, :]
-            if not self._return_full_embeddings:
-                _, candidate_timestamps = split_2D_jagged(
-                    values=seq_timestamps.unsqueeze(-1),
-                    max_seq_len=max_seq_len,
-                    total_len_left=total_uih_len,
-                    total_len_right=total_targets,
-                    max_len_left=max_uih_len,
-                    max_len_right=max_targets,
-                    offsets_left=uih_offsets,
-                    offsets_right=candidates_offsets,
-                    kernel=self.hammer_kernel(),
-                )
-                candidate_timestamps = candidate_timestamps.squeeze(-1)
-                if interleave_targets:
-                    candidate_timestamps = candidate_timestamps.view(-1, 2)[:, 0]
-                candidate_embeddings = self._output_postprocessor(
-                    seq_embeddings=candidate_embeddings,
-                    seq_timestamps=candidate_timestamps,
-                    seq_payloads=seq_payloads,
-                )
-            candidate_embeddings = nvtx_range_end_tensor(
-                candidate_embeddings,
-                "yambda_hstu/hstu/output_postprocessor",
-                output_postprocessor_nvtx,
+                candidate_timestamps = candidate_timestamps.view(-1, 2)[:, 0]
+            candidate_embeddings = self._output_postprocessor(
+                seq_embeddings=candidate_embeddings,
+                seq_timestamps=candidate_timestamps,
+                seq_payloads=seq_payloads,
             )
+        candidate_embeddings = nvtx_range_end_tensor(
+            candidate_embeddings,
+            "hstu/output_postprocessor",
+            output_postprocessor_nvtx,
+        )
 
-            return (
-                seq_embeddings if self._return_full_embeddings else None,
-                candidate_embeddings,
-            )
+        return (
+            seq_embeddings if self._return_full_embeddings else None,
+            candidate_embeddings,
+        )
 
     def forward(
         self,

@@ -2578,35 +2578,32 @@ def streaming_train_eval_loop(
                     max_steps=int(os.environ.get("DIAG_EMB_STEPS", "100")),
                     log_every=metric_log_frequency,
                 )
-            step_range = f"train/step rank={rank} global_step={current_train_step}"
-            with profile_range(step_range):
-                optimizer.zero_grad()
-                with profile_range("data/to_device"):
-                    sample.to(device)
-                (
-                    _,
-                    _,
-                    aux_losses,
-                    mt_target_preds,
-                    mt_target_labels,
-                    mt_target_weights,
-                ) = model.forward(
-                    sample.uih_features_kjt,
-                    sample.candidates_features_kjt,
+            optimizer.zero_grad()
+            with profile_range("data/to_device"):
+                sample.to(device)
+            (
+                _,
+                _,
+                aux_losses,
+                mt_target_preds,
+                mt_target_labels,
+                mt_target_weights,
+            ) = model.forward(
+                sample.uih_features_kjt,
+                sample.candidates_features_kjt,
+            )
+            # pyre-ignore
+            sum(aux_losses.values()).backward()
+            # Gradient clipping for the streaming path. Clips dense params (the
+            # sparse embedding tables use a fused optimizer and are unaffected,
+            # same as the non-streaming path's clip_grad_norm_). OFF by default
+            # (grad_clip_norm=0.0 via $GRAD_CLIP_NORM) so legacy streaming runs
+            # are byte-for-byte unchanged; set >0 to enable.
+            if grad_clip_norm and grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=grad_clip_norm
                 )
-                # pyre-ignore
-                sum(aux_losses.values()).backward()
-                # Gradient clipping for the streaming path. Clips dense params
-                # (the sparse embedding tables use a fused optimizer and are
-                # unaffected, same as the non-streaming path's clip_grad_norm_).
-                # OFF by default (grad_clip_norm=0.0 via $GRAD_CLIP_NORM) so
-                # legacy streaming runs are byte-for-byte unchanged; set >0 to
-                # enable.
-                if grad_clip_norm and grad_clip_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), max_norm=grad_clip_norm
-                    )
-                optimizer.step()
+            optimizer.step()
             metric_logger.update(
                 mode="train",
                 predictions=mt_target_preds,

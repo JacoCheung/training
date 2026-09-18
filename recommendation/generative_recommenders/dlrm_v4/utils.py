@@ -1634,6 +1634,7 @@ def get_dataset(
     streaming_shuffle_seed: int = 0,
     train_split_percentage: float = 1.0,
     split_salt: int = 0,
+    use_offline_ts_indices: bool = False,
 ):
     """
     Get dataset class and configuration by name.
@@ -1777,6 +1778,7 @@ def get_dataset(
                 # streaming-train-eval; ignored by the default train-eval path).
                 "streaming_window_seconds": streaming_window_seconds,
                 "streaming_sort_within_window": streaming_sort_within_window,
+                "use_offline_ts_indices": use_offline_ts_indices,
                 # In-window shuffle diversity dial in [0,1]: K=round(frac*N) within-
                 # segment shuffle. 0=off/user-major, 1=full. Config-invariant and
                 # deterministic by (seed, ts).
